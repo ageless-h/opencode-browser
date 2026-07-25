@@ -69,7 +69,16 @@ function writeJsonLine(socket, msg) {
 }
 
 function wantsTab(toolName) {
-  return !["get_tabs", "get_active_tab", "open_tab", "list_downloads"].includes(toolName);
+  return ![
+    "get_tabs",
+    "get_active_tab",
+    "open_tab",
+    "list_downloads",
+    "name_session",
+    "group_tabs",
+    "history",
+    "capabilities_list",
+  ].includes(toolName);
 }
 
 // --- State ---
@@ -79,9 +88,9 @@ const extPending = new Map(); // extId -> { pluginSocket, pluginRequestId, sessi
 
 const clients = new Set();
 
-// Tab ownership: tabId -> { sessionId, claimedAt, lastSeenAt }
+// Tab ownership: tabId -> { sessionId, claimedAt, lastSeenAt, origin, mark }
 const claims = new Map();
-// Session state: sessionId -> { defaultTabId, lastSeenAt }
+// Session state: sessionId -> { defaultTabId, lastSeenAt, name, groupId }
 const sessionState = new Map();
 
 function listClaims() {
@@ -92,6 +101,8 @@ function listClaims() {
       sessionId: info.sessionId,
       claimedAt: info.claimedAt,
       lastSeenAt: new Date(info.lastSeenAt).toISOString(),
+      origin: info.origin || "agent",
+      mark: info.mark || null,
     });
   }
   out.sort((a, b) => a.tabId - b.tabId);
@@ -105,14 +116,40 @@ function sessionHasClaims(sessionId) {
   return false;
 }
 
+function listSessionClaims(sessionId) {
+  const out = [];
+  for (const [tabId, info] of claims.entries()) {
+    if (info.sessionId === sessionId) out.push({ tabId, ...info });
+  }
+  return out;
+}
+
 function getSessionState(sessionId) {
   if (!sessionId) return null;
   let state = sessionState.get(sessionId);
   if (!state) {
-    state = { defaultTabId: null, lastSeenAt: nowMs() };
+    state = { defaultTabId: null, lastSeenAt: nowMs(), name: null, groupId: null, seedTabId: null };
     sessionState.set(sessionId, state);
   }
+  if (state.name === undefined) state.name = null;
+  if (state.groupId === undefined) state.groupId = null;
+  if (state.seedTabId === undefined) state.seedTabId = null;
   return state;
+}
+
+/** Close about:blank group seed once a real agent tab exists (Chrome needs a tab to create groups). */
+async function dropSeedTabIfReplaced(sessionId, keepTabId) {
+  const state = getSessionState(sessionId);
+  if (!state || !Number.isFinite(state.seedTabId)) return;
+  const seedId = state.seedTabId;
+  if (seedId === keepTabId) return;
+  state.seedTabId = null;
+  try {
+    await callExtension("close_tab", { tabId: seedId }, sessionId);
+  } catch {
+    // seed may already be gone
+  }
+  releaseClaim(seedId);
 }
 
 function touchSession(sessionId) {
@@ -160,23 +197,56 @@ function checkClaim(tabId, sessionId) {
   return { ok: false, error: `Tab ${tabId} is owned by another OpenCode session (${existing.sessionId})` };
 }
 
-function setClaim(tabId, sessionId) {
+function setClaim(tabId, sessionId, options = {}) {
   const existing = claims.get(tabId);
+  const origin = options.origin || existing?.origin || "agent";
+  const mark = options.mark !== undefined ? options.mark : existing?.mark || null;
   claims.set(tabId, {
     sessionId,
     claimedAt: existing ? existing.claimedAt : nowIso(),
     lastSeenAt: nowMs(),
+    origin,
+    mark,
   });
 }
 
-function touchClaim(tabId, sessionId) {
+function touchClaim(tabId, sessionId, options = {}) {
   const existing = claims.get(tabId);
   if (existing && existing.sessionId !== sessionId) return;
   if (existing) {
     existing.lastSeenAt = nowMs();
+    if (options.origin) existing.origin = options.origin;
+    if (options.mark !== undefined) existing.mark = options.mark;
   } else {
-    setClaim(tabId, sessionId);
+    setClaim(tabId, sessionId, options);
   }
+}
+
+function defaultSessionTitle(sessionId) {
+  const short = String(sessionId || "session").slice(0, 8);
+  return `🔎 OpenCode ${short}`;
+}
+
+async function ensureSessionGroup(sessionId) {
+  const state = getSessionState(sessionId);
+  if (!state) throw new Error("Missing sessionId");
+  const title = state.name || defaultSessionTitle(sessionId);
+  const res = await callExtension(
+    "name_session",
+    { title, groupId: Number.isFinite(state.groupId) ? state.groupId : undefined },
+    sessionId
+  );
+  const content = res && res.content != null ? res.content : res;
+  const groupId = content && Number.isFinite(content.groupId) ? content.groupId : null;
+  if (groupId != null) state.groupId = groupId;
+  if (!state.name) state.name = title;
+  const seedTabId = content && Number.isFinite(content.seedTabId) ? content.seedTabId : null;
+  // Seed tab is temporary about:blank scaffolding so Chrome can create an empty group.
+  if (seedTabId != null) {
+    state.seedTabId = seedTabId;
+    setClaim(seedTabId, sessionId, { origin: "agent", mark: null });
+  }
+  return { groupId: state.groupId, title: state.name, seedTabId, raw: content };
 }
 
 function cleanupStaleClaims() {
@@ -224,12 +294,138 @@ function callExtension(tool, args, sessionId) {
 
 async function ensureSessionTab(sessionId) {
   if (!sessionId) throw new Error("Missing sessionId for tab creation");
-  const res = await callExtension("open_tab", { active: false }, sessionId);
+  const state = getSessionState(sessionId);
+  let groupId = state && Number.isFinite(state.groupId) ? state.groupId : null;
+  if (groupId == null) {
+    const g = await ensureSessionGroup(sessionId);
+    groupId = g.groupId;
+  }
+  const res = await callExtension("open_tab", { active: false, groupId }, sessionId);
   const tabId = res && typeof res.tabId === "number" ? res.tabId : undefined;
   if (!tabId) throw new Error("Failed to create a new tab for this session");
-  touchClaim(tabId, sessionId);
+  const content = res && res.content != null ? res.content : {};
+  if (Number.isFinite(content.groupId)) state.groupId = content.groupId;
+  setClaim(tabId, sessionId, { origin: "agent", mark: null });
   setDefaultTab(sessionId, tabId);
+  await dropSeedTabIfReplaced(sessionId, tabId);
   return tabId;
+}
+
+async function handleNameSession(sessionId, args = {}) {
+  if (!sessionId) throw new Error("sessionId is required");
+  const state = getSessionState(sessionId);
+  const title =
+    typeof args.name === "string" && args.name.trim()
+      ? args.name.trim()
+      : typeof args.title === "string" && args.title.trim()
+        ? args.title.trim()
+        : state.name || defaultSessionTitle(sessionId);
+  state.name = title;
+  const res = await callExtension(
+    "name_session",
+    {
+      title,
+      groupId: Number.isFinite(state.groupId) ? state.groupId : undefined,
+      color: args.color,
+      collapsed: args.collapsed,
+    },
+    sessionId
+  );
+  const content = res && res.content != null ? res.content : res;
+  if (content && Number.isFinite(content.groupId)) state.groupId = content.groupId;
+  if (content && Number.isFinite(content.seedTabId)) {
+    state.seedTabId = content.seedTabId;
+    setClaim(content.seedTabId, sessionId, { origin: "agent", mark: null });
+  }
+  // If session already has a real default tab, drop the about:blank seed immediately.
+  if (Number.isFinite(state.defaultTabId) && state.defaultTabId !== state.seedTabId) {
+    await dropSeedTabIfReplaced(sessionId, state.defaultTabId);
+  }
+  return {
+    content: {
+      ok: true,
+      sessionId,
+      name: state.name,
+      groupId: state.groupId,
+      color: content?.color || null,
+      created: !!content?.created,
+      seedTabId: state.seedTabId || null,
+    },
+  };
+}
+
+async function handleMarkTab(sessionId, args = {}) {
+  const tabId = args.tabId;
+  const status = args.status;
+  if (!Number.isFinite(tabId)) throw new Error("tabId is required");
+  if (status !== "handoff" && status !== "deliverable" && status !== null) {
+    throw new Error('status must be "handoff", "deliverable", or null');
+  }
+  const existing = claims.get(tabId);
+  if (!existing || existing.sessionId !== sessionId) {
+    throw new Error(`Tab ${tabId} is not claimed by this session`);
+  }
+  existing.mark = status;
+  existing.lastSeenAt = nowMs();
+  return { content: { ok: true, tabId, status: existing.mark, origin: existing.origin } };
+}
+
+async function handleFinalize(sessionId, args = {}) {
+  if (!sessionId) throw new Error("sessionId is required");
+  const keepList = Array.isArray(args.keep) ? args.keep : [];
+  const keepMap = new Map();
+  for (const item of keepList) {
+    const tabId = item && Number.isFinite(item.tabId) ? item.tabId : null;
+    if (tabId == null) continue;
+    const status = item.status === "handoff" || item.status === "deliverable" ? item.status : "handoff";
+    keepMap.set(tabId, status);
+  }
+
+  const sessionClaims = listSessionClaims(sessionId);
+  const toClose = [];
+  const released = [];
+  const kept = [];
+
+  for (const claim of sessionClaims) {
+    const keepStatus = keepMap.has(claim.tabId) ? keepMap.get(claim.tabId) : claim.mark;
+    if (keepStatus === "handoff" || keepStatus === "deliverable") {
+      releaseClaim(claim.tabId);
+      kept.push({ tabId: claim.tabId, status: keepStatus, origin: claim.origin });
+      continue;
+    }
+    if (claim.origin === "user") {
+      releaseClaim(claim.tabId);
+      released.push({ tabId: claim.tabId, origin: "user" });
+    } else {
+      toClose.push(claim.tabId);
+    }
+  }
+
+  if (toClose.length) {
+    try {
+      await callExtension("close_tab", { tabIds: toClose }, sessionId);
+    } catch (err) {
+      // Close what we can; still drop claims.
+    }
+    for (const tabId of toClose) releaseClaim(tabId);
+  }
+
+  const state = getSessionState(sessionId);
+  // Keep name/groupId for continued work after finalize; claims may be empty.
+  return {
+    content: {
+      ok: true,
+      closed: toClose,
+      released,
+      kept,
+      session: {
+        sessionId,
+        name: state?.name || null,
+        groupId: state?.groupId || null,
+        defaultTabId: state?.defaultTabId || null,
+      },
+    },
+  };
 }
 
 async function handleTool(pluginSocket, req) {
@@ -238,10 +434,30 @@ async function handleTool(pluginSocket, req) {
 
   if (sessionId) touchSession(sessionId);
 
+  // Session-level tools (no default tab resolution)
+  if (tool === "name_session") return await handleNameSession(sessionId, args);
+  if (tool === "mark_tab") return await handleMarkTab(sessionId, args);
+  if (tool === "finalize") return await handleFinalize(sessionId, args);
+
   let tabId = args.tabId;
   const toolArgs = { ...args };
 
   const isCloseTool = tool === "close_tab";
+  const isOpenTool = tool === "open_tab";
+
+  if (isOpenTool) {
+    // Codex-aligned: default active false; agent tabs join session group.
+    if (toolArgs.active === undefined) toolArgs.active = false;
+    const state = getSessionState(sessionId);
+    if (!Number.isFinite(toolArgs.groupId)) {
+      let groupId = state && Number.isFinite(state.groupId) ? state.groupId : null;
+      if (groupId == null && sessionId) {
+        const g = await ensureSessionGroup(sessionId);
+        groupId = g.groupId;
+      }
+      if (Number.isFinite(groupId)) toolArgs.groupId = groupId;
+    }
+  }
 
   if (wantsTab(tool)) {
     if (typeof tabId !== "number") {
@@ -271,6 +487,20 @@ async function handleTool(pluginSocket, req) {
       } else {
         clearDefaultTab(sessionId, usedTabId);
       }
+      // Also release any extra closed ids from batch close
+      const closedIds = res?.content?.tabIds;
+      if (Array.isArray(closedIds)) {
+        for (const id of closedIds) {
+          if (Number.isFinite(id) && id !== usedTabId) releaseClaim(id);
+        }
+      }
+    } else if (isOpenTool) {
+      setClaim(usedTabId, sessionId, { origin: "agent", mark: null });
+      setDefaultTab(sessionId, usedTabId);
+      const content = res && res.content != null ? res.content : {};
+      const state = getSessionState(sessionId);
+      if (state && Number.isFinite(content.groupId)) state.groupId = content.groupId;
+      await dropSeedTabIfReplaced(sessionId, usedTabId);
     } else {
       touchClaim(usedTabId, sessionId);
       setDefaultTab(sessionId, usedTabId);
@@ -329,6 +559,8 @@ function handleClientMessage(socket, client, msg) {
                 sessionId,
                 defaultTabId: state.defaultTabId,
                 lastSeenAt: new Date(state.lastSeenAt).toISOString(),
+                name: state.name || null,
+                groupId: Number.isFinite(state.groupId) ? state.groupId : null,
               }
             : null;
           replyOk({
@@ -347,6 +579,7 @@ function handleClientMessage(socket, client, msg) {
         }
 
         if (msg.op === "claim_tab") {
+          // Codex: claim user tab without moving into agent tab group.
           const tabId = msg.tabId;
           const force = !!msg.force;
           if (typeof tabId !== "number") throw new Error("tabId is required");
@@ -357,9 +590,9 @@ function handleClientMessage(socket, client, msg) {
           if (existing && existing.sessionId !== sessionId && force) {
             clearDefaultTab(existing.sessionId, tabId);
           }
-          setClaim(tabId, sessionId);
+          setClaim(tabId, sessionId, { origin: "user", mark: null });
           setDefaultTab(sessionId, tabId);
-          replyOk({ ok: true, tabId, sessionId });
+          replyOk({ ok: true, tabId, sessionId, origin: "user" });
           return;
         }
 
@@ -376,6 +609,24 @@ function handleClientMessage(socket, client, msg) {
           }
           releaseClaim(tabId);
           replyOk({ ok: true, tabId, released: true });
+          return;
+        }
+
+        if (msg.op === "name_session") {
+          const result = await handleNameSession(sessionId, msg);
+          replyOk(result);
+          return;
+        }
+
+        if (msg.op === "mark_tab") {
+          const result = await handleMarkTab(sessionId, msg);
+          replyOk(result);
+          return;
+        }
+
+        if (msg.op === "finalize") {
+          const result = await handleFinalize(sessionId, msg);
+          replyOk(result);
           return;
         }
 

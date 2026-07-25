@@ -1,11 +1,15 @@
 var __defProp = Object.defineProperty;
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter.bind(all, name)
     });
 };
 
@@ -12879,10 +12883,95 @@ function createAgentBackend(sessionId) {
       case "list_downloads": {
         return { content: JSON.stringify({ downloads }, null, 2) };
       }
+      case "history": {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            unsupported: true,
+            message: "browser_history requires the Chrome extension backend (chrome.history); agent-browser has no user history API"
+          })
+        };
+      }
+      case "clipboard_read_text":
+      case "clipboard_write_text":
+      case "all_text_contents":
+      case "element_info":
+      case "capabilities_list":
+      case "viewport_set":
+      case "viewport_reset":
+      case "locator_all":
+      case "press":
+      case "download_media":
+      case "mouse_move":
+      case "mouse_click":
+      case "mouse_dblclick":
+      case "drag":
+      case "get_visible_dom":
+      case "element_screenshot": {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            unsupported: true,
+            message: `${tool3} requires the Chrome extension backend (Codex P4a/P4b/P5)`
+          })
+        };
+      }
+      case "count":
+      case "is_visible":
+      case "is_enabled":
+      case "get_attribute":
+      case "text_content":
+      case "inner_text":
+      case "dblclick":
+      case "check":
+      case "uncheck":
+      case "set_checked":
+      case "fill":
+      case "wait_for":
+      case "wait_for_load_state":
+      case "wait_for_url":
+      case "evaluate":
+      case "export":
+      case "get_js_dialog":
+      case "title":
+      case "url": {
+        if (tool3 === "title" || tool3 === "url") {
+          return await withTab(args.tabId, async () => {
+            const data = await agentCommand("get_url", {}).catch(() => null);
+            if (tool3 === "url") {
+              return { content: String(data?.url || data || "") };
+            }
+            try {
+              const t = await agentCommand("evaluate", { script: "document.title" });
+              return { content: String(t?.result ?? t ?? "") };
+            } catch {
+              return { content: "" };
+            }
+          });
+        }
+        if (tool3 === "fill") {
+          return await withTab(args.tabId, async () => {
+            if (!args.selector)
+              throw new Error("Selector is required");
+            const text = args.text ?? args.value ?? "";
+            await agentCommand("fill", { selector: args.selector, text: String(text) }).catch(async () => {
+              await agentCommand("type", { selector: args.selector, text: String(text), clear: true });
+            });
+            return { content: `Filled ${args.selector}` };
+          });
+        }
+        return {
+          content: JSON.stringify({
+            ok: false,
+            unsupported: true,
+            message: `${tool3} requires the Chrome extension backend (Codex Playwright subset)`
+          })
+        };
+      }
       case "open_tab": {
-        const active = args.active;
+        const active = args.active === true;
         let previousActive = null;
-        if (active === false) {
+        if (!active) {
           const list = await agentCommand("tab_list", {});
           if (Number.isFinite(list?.active))
             previousActive = list.active;
@@ -12891,10 +12980,40 @@ function createAgentBackend(sessionId) {
         if (args.url) {
           await agentCommand("navigate", { url: args.url });
         }
-        if (active === false && previousActive !== null) {
+        if (!active && previousActive !== null) {
           await agentCommand("tab_switch", { index: previousActive });
         }
-        return { content: { tabId: created.index, url: args.url, active: active !== false } };
+        return { content: { tabId: created.index, url: args.url, active } };
+      }
+      case "name_session": {
+        return {
+          content: JSON.stringify({
+            ok: true,
+            unsupported: true,
+            message: "name_session/tab groups require the Chrome extension backend",
+            name: args.name || args.title || null
+          })
+        };
+      }
+      case "mark_tab": {
+        return {
+          content: JSON.stringify({
+            ok: true,
+            unsupported: true,
+            message: "mark_tab requires the Chrome extension backend",
+            tabId: args.tabId,
+            status: args.status ?? null
+          })
+        };
+      }
+      case "finalize": {
+        return {
+          content: JSON.stringify({
+            ok: true,
+            unsupported: true,
+            message: "finalize requires the Chrome extension backend"
+          })
+        };
       }
       case "close_tab": {
         const payload = {};
@@ -12910,6 +13029,69 @@ function createAgentBackend(sessionId) {
             throw new Error("URL is required");
           await agentCommand("navigate", { url: args.url });
           return { content: `Navigated to ${args.url}` };
+        });
+      }
+      case "back": {
+        return await withTab(args.tabId, async () => {
+          await agentCommand("back", {});
+          return { content: JSON.stringify({ ok: true, action: "back" }) };
+        });
+      }
+      case "forward": {
+        return await withTab(args.tabId, async () => {
+          await agentCommand("forward", {});
+          return { content: JSON.stringify({ ok: true, action: "forward" }) };
+        });
+      }
+      case "reload": {
+        return await withTab(args.tabId, async () => {
+          await agentCommand("reload", {});
+          return {
+            content: JSON.stringify({
+              ok: true,
+              action: "reload",
+              bypassCache: !!args.bypassCache
+            })
+          };
+        });
+      }
+      case "set_active_tab": {
+        if (!Number.isFinite(args.tabId))
+          throw new Error("tabId is required");
+        await agentCommand("tab_switch", { index: args.tabId });
+        return {
+          content: JSON.stringify({ ok: true, tabId: args.tabId, active: true })
+        };
+      }
+      case "key": {
+        return await withTab(args.tabId, async () => {
+          if (!args.key)
+            throw new Error("key is required");
+          try {
+            await agentCommand("press", { key: String(args.key) });
+          } catch {
+            await agentCommand("keyboard", { key: String(args.key) });
+          }
+          return { content: JSON.stringify({ ok: true, key: String(args.key) }) };
+        });
+      }
+      case "handle_dialog": {
+        return await withTab(args.tabId, async () => {
+          const action = typeof args.action === "string" ? args.action.toLowerCase() : "accept";
+          if (action !== "accept" && action !== "dismiss") {
+            throw new Error('action must be "accept" or "dismiss"');
+          }
+          try {
+            await agentCommand("dialog", {
+              action,
+              promptText: args.promptText
+            });
+          } catch (err) {
+            throw new Error(`handle_dialog unsupported or failed on agent-browser backend: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          return {
+            content: JSON.stringify({ ok: true, action })
+          };
         });
       }
       case "download": {
@@ -13395,7 +13577,7 @@ var plugin = async (ctx) => {
         }
       }),
       browser_claim_tab: tool({
-        description: "Claim a browser tab for this session",
+        description: "Claim an existing user tab for this session without moving it into the agent tab group (Codex claimTab).",
         args: {
           tabId: schema.number(),
           force: schema.boolean().optional()
@@ -13415,8 +13597,50 @@ var plugin = async (ctx) => {
           return JSON.stringify(data);
         }
       }),
+      browser_name_session: tool({
+        description: "Name this browser session and create/update its Chrome tab group (Codex nameSession). " + "Call early; subsequent open_tab agent tabs join the group.",
+        args: {
+          name: schema.string(),
+          color: schema.string().optional(),
+          collapsed: schema.boolean().optional()
+        },
+        async execute({ name, color, collapsed }, ctx2) {
+          const data = await brokerOnlyRequest("name_session", { name, color, collapsed });
+          return toolResultText(data, JSON.stringify(data));
+        }
+      }),
+      browser_mark_tab: tool({
+        description: "Mark a claimed tab as handoff or deliverable for finalize (Codex markHandoff/markDeliverable). " + "status null clears the mark.",
+        args: {
+          tabId: schema.number(),
+          status: schema.string()
+        },
+        async execute({ tabId, status }, ctx2) {
+          const normalized = status === "null" || status === "" ? null : status;
+          const data = await brokerOnlyRequest("mark_tab", { tabId, status: normalized });
+          return toolResultText(data, JSON.stringify(data));
+        }
+      }),
+      browser_finalize: tool({
+        description: "Explicitly clean up session tabs (Codex tabs.finalize). Unmarked agent tabs close; " + "user claims and handoff/deliverable tabs are released and left open. Does not disconnect.",
+        args: {
+          keep: schema.string().optional()
+        },
+        async execute({ keep }, ctx2) {
+          let keepList;
+          if (typeof keep === "string" && keep.trim()) {
+            try {
+              keepList = JSON.parse(keep);
+            } catch {
+              throw new Error('keep must be JSON array like [{"tabId":1,"status":"handoff"}]');
+            }
+          }
+          const data = await brokerOnlyRequest("finalize", { keep: keepList });
+          return toolResultText(data, JSON.stringify(data));
+        }
+      }),
       browser_open_tab: tool({
-        description: "Open a new browser tab",
+        description: "Open a new agent tab (default active:false — does not steal foreground). " + "Joins the session Chrome tab group when available.",
         args: {
           url: schema.string().optional(),
           active: schema.boolean().optional()
@@ -13447,8 +13671,99 @@ var plugin = async (ctx) => {
           return toolResultText(data, `Navigated to ${url2}`);
         }
       }),
+      browser_back: tool({
+        description: "Navigate the tab back in history",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("back", { tabId });
+          return toolResultText(data, "Navigated back");
+        }
+      }),
+      browser_forward: tool({
+        description: "Navigate the tab forward in history",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("forward", { tabId });
+          return toolResultText(data, "Navigated forward");
+        }
+      }),
+      browser_reload: tool({
+        description: "Reload the current page",
+        args: {
+          tabId: schema.number().optional(),
+          bypassCache: schema.boolean().optional()
+        },
+        async execute({ tabId, bypassCache }, ctx2) {
+          const data = await toolRequest("reload", { tabId, bypassCache });
+          return toolResultText(data, "Reloaded");
+        }
+      }),
+      browser_set_active_tab: tool({
+        description: "Activate a claimed browser tab (bring it to the foreground)",
+        args: {
+          tabId: schema.number()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("set_active_tab", { tabId });
+          return toolResultText(data, `Activated tab ${tabId}`);
+        }
+      }),
+      browser_key: tool({
+        description: "Press a keyboard key on the focused element (or an optional selector). " + "Use for Enter, Escape, Tab, arrows, and modifier combinations.",
+        args: {
+          key: schema.string(),
+          code: schema.string().optional(),
+          keyCode: schema.number().optional(),
+          ctrlKey: schema.boolean().optional(),
+          metaKey: schema.boolean().optional(),
+          altKey: schema.boolean().optional(),
+          shiftKey: schema.boolean().optional(),
+          repeat: schema.boolean().optional(),
+          delayMs: schema.number().optional(),
+          selector: schema.string().optional(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ key, code, keyCode, ctrlKey, metaKey, altKey, shiftKey, repeat, delayMs, selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("key", {
+            key,
+            code,
+            keyCode,
+            ctrlKey,
+            metaKey,
+            altKey,
+            shiftKey,
+            repeat,
+            delayMs,
+            selector,
+            index,
+            tabId,
+            timeoutMs,
+            pollMs
+          });
+          return toolResultText(data, `Pressed ${key}`);
+        }
+      }),
+      browser_handle_dialog: tool({
+        description: "Accept or dismiss a pending JavaScript dialog (alert/confirm/prompt). " + "Requires debugger permission; attach before the dialog opens (calling this tool, browser_console, or browser_errors attaches).",
+        args: {
+          action: schema.string().optional(),
+          promptText: schema.string().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ action, promptText, tabId }, ctx2) {
+          const data = await toolRequest("handle_dialog", { action, promptText, tabId });
+          return toolResultText(data, "Handled dialog");
+        }
+      }),
       browser_click: tool({
-        description: "Click an element on the page using a CSS selector",
+        description: "Click an element. selector supports CSS and locators: uid:e12, role:button[name=Submit], " + "label:, aria:, text:, placeholder:, name:, id:. Omit index → strict unique match; multi-match returns candidates.",
         args: {
           selector: schema.string(),
           index: schema.number().optional(),
@@ -13462,7 +13777,7 @@ var plugin = async (ctx) => {
         }
       }),
       browser_type: tool({
-        description: "Type text into an input element",
+        description: "Type text into an input. selector supports CSS and locators (uid:/role:/label:/…); " + "omit index for strict unique match.",
         args: {
           selector: schema.string(),
           text: schema.string(),
@@ -13478,7 +13793,7 @@ var plugin = async (ctx) => {
         }
       }),
       browser_select: tool({
-        description: "Select an option in a native select element",
+        description: "Select an option in a native select. selector supports CSS and locators (uid:/role:/…); " + "omit index for strict unique match.",
         args: {
           selector: schema.string(),
           value: schema.string().optional(),
@@ -13495,18 +13810,499 @@ var plugin = async (ctx) => {
           return toolResultText(data, `Selected ${summary} in ${selector}`);
         }
       }),
-      browser_screenshot: tool({
-        description: "Take a screenshot of the current page. Returns base64 image data URL.",
+      browser_count: tool({
+        description: "Count elements matching selector (Codex locator.count). Prefer before click when uniqueness is unclear.",
+        args: {
+          selector: schema.string(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("count", { selector, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "0");
+        }
+      }),
+      browser_is_visible: tool({
+        description: "Whether the matched element is visible (Codex locator.isVisible). Strict unique match when index omitted.",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("is_visible", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "false");
+        }
+      }),
+      browser_is_enabled: tool({
+        description: "Whether the matched element is enabled (Codex locator.isEnabled).",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("is_enabled", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "false");
+        }
+      }),
+      browser_get_attribute: tool({
+        description: "Read one attribute from a matched element (Codex locator.getAttribute).",
+        args: {
+          selector: schema.string(),
+          name: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, name, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("get_attribute", { selector, name, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "null");
+        }
+      }),
+      browser_text_content: tool({
+        description: "Element textContent (Codex locator.textContent).",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("text_content", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "");
+        }
+      }),
+      browser_inner_text: tool({
+        description: "Element innerText (Codex locator.innerText).",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("inner_text", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "");
+        }
+      }),
+      browser_dblclick: tool({
+        description: "Double-click an element (Codex locator.dblclick). Strict unique match when index omitted.",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("dblclick", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, `Double-clicked ${selector}`);
+        }
+      }),
+      browser_check: tool({
+        description: "Check a checkbox/radio (Codex locator.check).",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("check", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "checked");
+        }
+      }),
+      browser_uncheck: tool({
+        description: "Uncheck a checkbox (Codex locator.uncheck).",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("uncheck", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "unchecked");
+        }
+      }),
+      browser_set_checked: tool({
+        description: "Set checkbox/radio checked state (Codex locator.setChecked).",
+        args: {
+          selector: schema.string(),
+          checked: schema.boolean().optional(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, checked, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("set_checked", {
+            selector,
+            checked: checked !== false,
+            index,
+            tabId,
+            timeoutMs,
+            pollMs
+          });
+          return toolResultText(data, "set_checked");
+        }
+      }),
+      browser_fill: tool({
+        description: "Fill an input (clear then set value; Codex locator.fill).",
+        args: {
+          selector: schema.string(),
+          text: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, text, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("fill", { selector, text, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, `Filled ${selector}`);
+        }
+      }),
+      browser_wait_for: tool({
+        description: "Wait for locator state (Codex locator.waitFor). state: attached|detached|visible|hidden.",
+        args: {
+          selector: schema.string(),
+          state: schema.string().optional(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, state, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("wait_for", {
+            selector,
+            state: state || "visible",
+            index,
+            tabId,
+            timeoutMs,
+            pollMs
+          });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_wait_for_load_state: tool({
+        description: 'Wait for page load state (Codex waitForLoadState): "load" | "domcontentloaded" | "networkidle".',
+        args: {
+          state: schema.string().optional(),
+          timeoutMs: schema.number().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ state, timeoutMs, tabId }, ctx2) {
+          const data = await toolRequest("wait_for_load_state", {
+            state: state || "load",
+            timeoutMs,
+            tabId
+          });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_wait_for_url: tool({
+        description: "Wait until tab URL matches (Codex waitForURL). url can be exact, substring, glob with *, or re:pattern.",
+        args: {
+          url: schema.string(),
+          timeoutMs: schema.number().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ url: url2, timeoutMs, tabId }, ctx2) {
+          const data = await toolRequest("wait_for_url", { url: url2, timeoutMs, tabId });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_evaluate: tool({
+        description: "Read-only page evaluate (Codex playwright.evaluate). Pass expression string; optional selector scopes to element as `el`.",
+        args: {
+          expression: schema.string(),
+          selector: schema.string().optional(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ expression, selector, index, tabId }, ctx2) {
+          const data = await toolRequest("evaluate", { expression, selector, index, tabId });
+          return toolResultText(data, "null");
+        }
+      }),
+      browser_export: tool({
+        description: 'Export page content (Codex Tab.content.export). contentType: "html" | "text" | "domSnapshot".',
+        args: {
+          contentType: schema.string().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ contentType, tabId }, ctx2) {
+          const data = await toolRequest("export", { contentType: contentType || "text", tabId });
+          return toolResultText(data, "");
+        }
+      }),
+      browser_get_js_dialog: tool({
+        description: "Return pending JS dialog if any (Codex Tab.getJsDialog). Prefer attaching via console/errors/handle_dialog before dialog opens.",
         args: {
           tabId: schema.number().optional()
         },
         async execute({ tabId }, ctx2) {
-          const data = await toolRequest("screenshot", { tabId });
+          const data = await toolRequest("get_js_dialog", { tabId });
+          return toolResultText(data, '{"dialog":null}');
+        }
+      }),
+      browser_title: tool({
+        description: "Current tab title (Codex Tab.title).",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("title", { tabId });
+          return toolResultText(data, "");
+        }
+      }),
+      browser_url: tool({
+        description: "Current tab URL (Codex Tab.url).",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("url", { tabId });
+          return toolResultText(data, "");
+        }
+      }),
+      browser_screenshot: tool({
+        description: "Take a screenshot of the tab (Codex tab.screenshot). Returns base64 image data URL. " + "Options: fullPage (capture beyond viewport via CDP), clip:{x,y,width,height}.",
+        args: {
+          tabId: schema.number().optional(),
+          fullPage: schema.boolean().optional(),
+          clip: schema.any().optional()
+        },
+        async execute({ tabId, fullPage, clip }, ctx2) {
+          const data = await toolRequest("screenshot", { tabId, fullPage, clip });
           return toolResultText(data, "Screenshot failed");
         }
       }),
+      browser_clipboard_read_text: tool({
+        description: "Read plain text from the browser clipboard (Codex tab.clipboard.readText).",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("clipboard_read_text", { tabId });
+          return toolResultText(data, "");
+        }
+      }),
+      browser_clipboard_write_text: tool({
+        description: "Write plain text to the browser clipboard (Codex tab.clipboard.writeText).",
+        args: {
+          text: schema.string(),
+          tabId: schema.number().optional()
+        },
+        async execute({ text, tabId }, ctx2) {
+          const data = await toolRequest("clipboard_write_text", { text, tabId });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_all_text_contents: tool({
+        description: "Return textContent for all elements matched by the locator (Codex locator.allTextContents). Not strict-unique.",
+        args: {
+          selector: schema.string(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional(),
+          limit: schema.number().optional()
+        },
+        async execute({ selector, tabId, timeoutMs, pollMs, limit }, ctx2) {
+          const data = await toolRequest("all_text_contents", {
+            selector,
+            tabId,
+            timeoutMs,
+            pollMs,
+            limit
+          });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_element_info: tool({
+        description: "Return locator-oriented metadata for elements at a screenshot coordinate (Codex playwright.elementInfo).",
+        args: {
+          x: schema.number(),
+          y: schema.number(),
+          includeNonInteractable: schema.boolean().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ x, y, includeNonInteractable, tabId }, ctx2) {
+          const data = await toolRequest("element_info", {
+            x,
+            y,
+            includeNonInteractable,
+            tabId
+          });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_locator_all: tool({
+        description: "Resolve locator to a list of element descriptors (Codex locator.all).",
+        args: {
+          selector: schema.string(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("locator_all", { selector, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_press: tool({
+        description: "Press a keyboard key while the locator is focused (Codex locator.press).",
+        args: {
+          selector: schema.string(),
+          key: schema.string().optional(),
+          keys: schema.array(schema.string()).optional(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, key, keys, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("press", { selector, key, keys, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_download_media: tool({
+        description: "Trigger download for media or file link in the matched element (Codex locator.downloadMedia / dom_cua.downloadMedia).",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("download_media", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_mouse_move: tool({
+        description: "Move the mouse to a viewport coordinate (Codex CUA move).",
+        args: {
+          x: schema.number(),
+          y: schema.number(),
+          tabId: schema.number().optional()
+        },
+        async execute({ x, y, tabId }, ctx2) {
+          const data = await toolRequest("mouse_move", { x, y, tabId });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_mouse_click: tool({
+        description: "Click at a coordinate in the current viewport (Codex CUA click).",
+        args: {
+          x: schema.number(),
+          y: schema.number(),
+          button: schema.number().optional(),
+          keypress: schema.array(schema.string()).optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ x, y, button, keypress, tabId }, ctx2) {
+          const data = await toolRequest("mouse_click", { x, y, button, keypress, tabId });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_mouse_dblclick: tool({
+        description: "Double click at a coordinate in the current viewport (Codex CUA double_click).",
+        args: {
+          x: schema.number(),
+          y: schema.number(),
+          keypress: schema.array(schema.string()).optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ x, y, keypress, tabId }, ctx2) {
+          const data = await toolRequest("mouse_dblclick", { x, y, keypress, tabId });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_drag: tool({
+        description: "Drag from point to point by the provided path (Codex CUA drag).",
+        args: {
+          path: schema.array(schema.any()),
+          keys: schema.array(schema.string()).optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ path, keys, tabId }, ctx2) {
+          const data = await toolRequest("drag", { path, keys, tabId });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_get_visible_dom: tool({
+        description: "Return filtered visible DOM with node ids for interactable elements (Codex dom_cua.get_visible_dom).",
+        args: {
+          tabId: schema.number().optional(),
+          limit: schema.number().optional()
+        },
+        async execute({ tabId, limit }, ctx2) {
+          const data = await toolRequest("get_visible_dom", { tabId, limit });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_element_screenshot: tool({
+        description: "Capture element-oriented metadata at coordinate (Codex playwright.elementScreenshot). " + "Returns bounds/probed point; combine with browser_screenshot for visual.",
+        args: {
+          x: schema.number(),
+          y: schema.number(),
+          includeNonInteractable: schema.boolean().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ x, y, includeNonInteractable, tabId }, ctx2) {
+          const data = await toolRequest("element_screenshot", {
+            x,
+            y,
+            includeNonInteractable,
+            tabId
+          });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_capabilities_list: tool({
+        description: "List browser/tab capabilities advertised by this backend (Codex browser.capabilities.list). " + "Only use capability IDs returned here; check supported flags.",
+        args: {},
+        async execute(_args, ctx2) {
+          const data = await toolRequest("capabilities_list", {});
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_viewport_set: tool({
+        description: "Apply browser viewport override (Codex viewport capability set). " + "Only when user asks for specific dimensions / responsive testing. Call browser_viewport_reset before finish unless asked to keep.",
+        args: {
+          width: schema.number(),
+          height: schema.number(),
+          tabId: schema.number().optional()
+        },
+        async execute({ width, height, tabId }, ctx2) {
+          const data = await toolRequest("viewport_set", { width, height, tabId });
+          return toolResultText(data, "ok");
+        }
+      }),
+      browser_viewport_reset: tool({
+        description: "Clear explicit viewport override (Codex viewport capability reset).",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("viewport_reset", { tabId });
+          return toolResultText(data, "ok");
+        }
+      }),
       browser_snapshot: tool({
-        description: "Get an accessibility tree snapshot of the page.",
+        description: "Get a page snapshot with uid-stamped nodes (data-opc-uid). Use returned uid values as " + "selector uid:eN for strict actions. Nodes include role, name, tag, visible, and form state.",
         args: {
           tabId: schema.number().optional()
         },
@@ -13616,8 +14412,39 @@ var plugin = async (ctx) => {
           return toolResultText(data, "[]");
         }
       }),
+      browser_history: tool({
+        description: "List recent browsing history ordered by dateVisited descending (Codex browser.user.history). " + "High-sensitivity: call only when necessary for the request, never speculatively; " + "prefer one focused call with date bounds and a small known set of queries.",
+        args: {
+          queries: schema.string().optional(),
+          from: schema.string().optional(),
+          to: schema.string().optional(),
+          limit: schema.number().optional()
+        },
+        async execute({ queries, from, to, limit }, ctx2) {
+          let queryList;
+          if (typeof queries === "string" && queries.trim()) {
+            try {
+              const parsed = JSON.parse(queries);
+              if (Array.isArray(parsed)) {
+                queryList = parsed.map((q) => String(q));
+              } else {
+                queryList = [queries.trim()];
+              }
+            } catch {
+              queryList = [queries.trim()];
+            }
+          }
+          const data = await toolRequest("history", {
+            queries: queryList,
+            from,
+            to,
+            limit
+          });
+          return toolResultText(data, "[]");
+        }
+      }),
       browser_set_file_input: tool({
-        description: "Set a file input element's selected file using a local file path.",
+        description: "Set a file input's selected file via local path. selector supports locators (uid:/…); " + "omit index for strict unique match.",
         args: {
           selector: schema.string(),
           filePath: schema.string(),
@@ -13646,7 +14473,7 @@ var plugin = async (ctx) => {
         }
       }),
       browser_highlight: tool({
-        description: "Highlight an element on the page with a colored border for visual debugging.",
+        description: "Highlight an element with a colored border. selector supports locators (uid:/role:/…); " + "omit index for strict unique match.",
         args: {
           selector: schema.string(),
           index: schema.number().optional(),

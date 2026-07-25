@@ -650,10 +650,97 @@ export function createAgentBackend(sessionId: string): AgentBackend {
       case "list_downloads": {
         return { content: JSON.stringify({ downloads }, null, 2) };
       }
+      case "history": {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            unsupported: true,
+            message:
+              "browser_history requires the Chrome extension backend (chrome.history); agent-browser has no user history API",
+          }),
+        };
+      }
+      case "clipboard_read_text":
+      case "clipboard_write_text":
+      case "all_text_contents":
+      case "element_info":
+      case "capabilities_list":
+      case "viewport_set":
+      case "viewport_reset":
+      case "locator_all":
+      case "press":
+      case "download_media":
+      case "mouse_move":
+      case "mouse_click":
+      case "mouse_dblclick":
+      case "drag":
+      case "get_visible_dom":
+      case "element_screenshot": {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            unsupported: true,
+            message: `${tool} requires the Chrome extension backend (Codex P4a/P4b/P5)`,
+          }),
+        };
+      }
+      case "count":
+      case "is_visible":
+      case "is_enabled":
+      case "get_attribute":
+      case "text_content":
+      case "inner_text":
+      case "dblclick":
+      case "check":
+      case "uncheck":
+      case "set_checked":
+      case "fill":
+      case "wait_for":
+      case "wait_for_load_state":
+      case "wait_for_url":
+      case "evaluate":
+      case "export":
+      case "get_js_dialog":
+      case "title":
+      case "url": {
+        if (tool === "title" || tool === "url") {
+          return await withTab(args.tabId, async () => {
+            const data = await agentCommand("get_url", {}).catch(() => null);
+            if (tool === "url") {
+              return { content: String(data?.url || data || "") };
+            }
+            // best-effort title via evaluate if available
+            try {
+              const t = await agentCommand("evaluate", { script: "document.title" });
+              return { content: String(t?.result ?? t ?? "") };
+            } catch {
+              return { content: "" };
+            }
+          });
+        }
+        if (tool === "fill") {
+          return await withTab(args.tabId, async () => {
+            if (!args.selector) throw new Error("Selector is required");
+            const text = args.text ?? args.value ?? "";
+            await agentCommand("fill", { selector: args.selector, text: String(text) }).catch(async () => {
+              await agentCommand("type", { selector: args.selector, text: String(text), clear: true });
+            });
+            return { content: `Filled ${args.selector}` };
+          });
+        }
+        return {
+          content: JSON.stringify({
+            ok: false,
+            unsupported: true,
+            message: `${tool} requires the Chrome extension backend (Codex Playwright subset)`,
+          }),
+        };
+      }
       case "open_tab": {
-        const active = args.active;
+        // Default non-stealing: active false unless explicitly true.
+        const active = args.active === true;
         let previousActive: number | null = null;
-        if (active === false) {
+        if (!active) {
           const list = await agentCommand("tab_list", {});
           if (Number.isFinite(list?.active)) previousActive = list.active;
         }
@@ -661,10 +748,40 @@ export function createAgentBackend(sessionId: string): AgentBackend {
         if (args.url) {
           await agentCommand("navigate", { url: args.url });
         }
-        if (active === false && previousActive !== null) {
+        if (!active && previousActive !== null) {
           await agentCommand("tab_switch", { index: previousActive });
         }
-        return { content: { tabId: created.index, url: args.url, active: active !== false } };
+        return { content: { tabId: created.index, url: args.url, active } };
+      }
+      case "name_session": {
+        return {
+          content: JSON.stringify({
+            ok: true,
+            unsupported: true,
+            message: "name_session/tab groups require the Chrome extension backend",
+            name: args.name || args.title || null,
+          }),
+        };
+      }
+      case "mark_tab": {
+        return {
+          content: JSON.stringify({
+            ok: true,
+            unsupported: true,
+            message: "mark_tab requires the Chrome extension backend",
+            tabId: args.tabId,
+            status: args.status ?? null,
+          }),
+        };
+      }
+      case "finalize": {
+        return {
+          content: JSON.stringify({
+            ok: true,
+            unsupported: true,
+            message: "finalize requires the Chrome extension backend",
+          }),
+        };
       }
       case "close_tab": {
         const payload: Record<string, any> = {};
@@ -678,6 +795,72 @@ export function createAgentBackend(sessionId: string): AgentBackend {
           if (!args.url) throw new Error("URL is required");
           await agentCommand("navigate", { url: args.url });
           return { content: `Navigated to ${args.url}` };
+        });
+      }
+      case "back": {
+        return await withTab(args.tabId, async () => {
+          await agentCommand("back", {});
+          return { content: JSON.stringify({ ok: true, action: "back" }) };
+        });
+      }
+      case "forward": {
+        return await withTab(args.tabId, async () => {
+          await agentCommand("forward", {});
+          return { content: JSON.stringify({ ok: true, action: "forward" }) };
+        });
+      }
+      case "reload": {
+        return await withTab(args.tabId, async () => {
+          await agentCommand("reload", {});
+          return {
+            content: JSON.stringify({
+              ok: true,
+              action: "reload",
+              bypassCache: !!args.bypassCache,
+            }),
+          };
+        });
+      }
+      case "set_active_tab": {
+        if (!Number.isFinite(args.tabId)) throw new Error("tabId is required");
+        await agentCommand("tab_switch", { index: args.tabId });
+        return {
+          content: JSON.stringify({ ok: true, tabId: args.tabId, active: true }),
+        };
+      }
+      case "key": {
+        return await withTab(args.tabId, async () => {
+          if (!args.key) throw new Error("key is required");
+          // Prefer press when available; fall back to keyboard-style type for single keys.
+          try {
+            await agentCommand("press", { key: String(args.key) });
+          } catch {
+            await agentCommand("keyboard", { key: String(args.key) });
+          }
+          return { content: JSON.stringify({ ok: true, key: String(args.key) }) };
+        });
+      }
+      case "handle_dialog": {
+        return await withTab(args.tabId, async () => {
+          const action = typeof args.action === "string" ? args.action.toLowerCase() : "accept";
+          if (action !== "accept" && action !== "dismiss") {
+            throw new Error('action must be "accept" or "dismiss"');
+          }
+          try {
+            await agentCommand("dialog", {
+              action,
+              promptText: args.promptText,
+            });
+          } catch (err) {
+            throw new Error(
+              `handle_dialog unsupported or failed on agent-browser backend: ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            );
+          }
+          return {
+            content: JSON.stringify({ ok: true, action }),
+          };
         });
       }
       case "download": {
