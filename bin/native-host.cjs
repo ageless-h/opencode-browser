@@ -138,7 +138,9 @@ function onStdinData(chunk, onMessage) {
 
   process.stdin.on("data", (chunk) =>
     onStdinData(chunk, (message) => {
-      // Forward extension-origin messages to broker.
+      // Forward extension-origin messages to broker. Tool responses and
+      // lifecycle events ({type:"event", event:"tab_removed"/"tab_group_removed"})
+      // share this same passthrough channel; the broker routes them by type.
       writeJsonLine(broker, { type: "from_extension", message });
     })
   );

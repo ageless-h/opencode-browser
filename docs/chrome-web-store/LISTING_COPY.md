@@ -35,11 +35,11 @@ Important:
 
 ## Support URL
 
-https://github.com/different-ai/opencode-browser/issues
+https://github.com/ageless-h/opencode-browser/issues
 
 ## Homepage URL
 
-https://github.com/different-ai/opencode-browser
+https://github.com/ageless-h/opencode-browser
 
 ## Privacy policy URL
 

@@ -245,7 +245,20 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (chrome.debugger?.detach) chrome.debugger.detach({ tabId }).catch(() => {})
     debuggerState.delete(tabId)
   }
+  cdpMouseState.delete(tabId)
+  // Fire-and-forget lifecycle event for the broker (self-healing). If the
+  // native port is momentarily disconnected, send() returns false and the
+  // event is dropped — broker restart recovery handles state anyway.
+  send({ type: "event", event: "tab_removed", tabId })
 })
+
+if (chrome.tabGroups?.onRemoved) {
+  chrome.tabGroups.onRemoved.addListener((group) => {
+    const groupId = typeof group === "number" ? group : group?.id
+    if (!Number.isFinite(groupId)) return
+    send({ type: "event", event: "tab_group_removed", groupId })
+  })
+}
 
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.25 })
 
@@ -1009,6 +1022,32 @@ async function pageOps(command, args) {
   const flags = typeof options.flags === "string" ? options.flags : "i"
   const queryIndex = Number.isFinite(index) ? index : 0
 
+  if (command === "resolve_point") {
+    // Resolve locator (same strict semantics as click), scroll into view, and
+    // return the element's viewport-center coordinates so the extension can
+    // activate it with a trusted CDP mouse click.
+    const match = await resolveActionMatch(selectors, index, timeoutMs, pollMs)
+    if (match.ambiguous) return strictMatchError(match.selectorUsed, match.matches)
+    if (!match.chosen) {
+      return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    }
+    try {
+      match.chosen.scrollIntoView({ block: "center", inline: "center" })
+    } catch {}
+    const rect = match.chosen.getBoundingClientRect()
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1)
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1)
+    return {
+      ok: true,
+      selectorUsed: match.selectorUsed,
+      uid: match.chosen.getAttribute?.("data-opc-uid") || null,
+      count: match.matches.length,
+      x,
+      y,
+      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    }
+  }
+
   if (command === "click") {
     const match = await resolveActionMatch(selectors, index, timeoutMs, pollMs)
     if (match.ambiguous) return strictMatchError(match.selectorUsed, match.matches)
@@ -1271,37 +1310,44 @@ async function pageOps(command, args) {
     target.dispatchEvent(down)
 
     if (key.length === 1 && !ctrlKey && !metaKey && !altKey) {
+      // Shift+letter/digit inserts the SHIFTED character (US layout).
+      let insertChar = key
+      if (shiftKey) {
+        const SHIFT_CHARS = { "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(", "0": ")", "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|", ";": ":", "'": '"', ",": "<", ".": ">", "/": "?", "`": "~" }
+        if (/^[a-z]$/i.test(key)) insertChar = key.toUpperCase()
+        else if (Object.prototype.hasOwnProperty.call(SHIFT_CHARS, key)) insertChar = SHIFT_CHARS[key]
+      }
       try {
         const tag = (target.tagName || "").toUpperCase()
         const isTextInput = tag === "INPUT" || tag === "TEXTAREA"
         if (isTextInput && !target.readOnly && !target.disabled) {
           const start = typeof target.selectionStart === "number" ? target.selectionStart : target.value.length
           const end = typeof target.selectionEnd === "number" ? target.selectionEnd : start
-          const next = String(target.value || "").slice(0, start) + key + String(target.value || "").slice(end)
+          const next = String(target.value || "").slice(0, start) + insertChar + String(target.value || "").slice(end)
           const proto = tag === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype
           const descriptor = Object.getOwnPropertyDescriptor(proto, "value")
           if (descriptor?.set) descriptor.set.call(target, next)
           else target.value = next
-          const pos = start + key.length
+          const pos = start + insertChar.length
           try {
             target.setSelectionRange(pos, pos)
           } catch {}
           target.dispatchEvent(new Event("input", { bubbles: true }))
         } else if (target.isContentEditable) {
-          target.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, data: key, inputType: "insertText" }))
+          target.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, data: insertChar, inputType: "insertText" }))
           // Best-effort insert for contenteditable when no framework handler
           if (document.getSelection) {
             const sel = document.getSelection()
             if (sel && sel.rangeCount) {
               const range = sel.getRangeAt(0)
               range.deleteContents()
-              range.insertNode(document.createTextNode(key))
+              range.insertNode(document.createTextNode(insertChar))
               range.collapse(false)
               sel.removeAllRanges()
               sel.addRange(range)
             }
           }
-          target.dispatchEvent(new InputEvent("input", { bubbles: true, data: key, inputType: "insertText" }))
+          target.dispatchEvent(new InputEvent("input", { bubbles: true, data: insertChar, inputType: "insertText" }))
         }
       } catch {}
     }
@@ -1437,10 +1483,11 @@ async function pageOps(command, args) {
     const match = await resolveMatches(selectors, queryIndex, timeoutMs, pollMs)
 
     if (mode === "exists") {
+      // Observation mode: count every DOM match (incl. hidden).
       return {
         ok: true,
         selectorUsed: match.selectorUsed,
-        value: { exists: match.matches.length > 0, count: match.matches.length },
+        value: { exists: match.allMatches.length > 0, count: match.allMatches.length },
       }
     }
 
@@ -1473,8 +1520,9 @@ async function pageOps(command, args) {
     }
 
     if (mode === "list") {
+      // Observation mode: enumerate every DOM match (incl. hidden).
       const maxItems = Math.min(Math.max(1, limit), 200)
-      const items = match.matches.slice(0, maxItems).map((el) => ({
+      const items = match.allMatches.slice(0, maxItems).map((el) => ({
         text: (el.innerText || el.textContent || "").trim().slice(0, 200),
         tag: (el.tagName || "").toLowerCase(),
         ariaLabel: el.getAttribute ? el.getAttribute("aria-label") : null,
@@ -1482,7 +1530,7 @@ async function pageOps(command, args) {
       return {
         ok: true,
         selectorUsed: match.selectorUsed,
-        value: { items, count: match.matches.length },
+        value: { items, count: match.allMatches.length },
       }
     }
 
@@ -1494,10 +1542,12 @@ async function pageOps(command, args) {
   if (command === "count") {
     if (!selectors.length) return { ok: false, error: "Selector is required" }
     const match = await resolveMatches(selectors, 0, timeoutMs, pollMs)
+    // Collection/observation tools count EVERY DOM match (incl. hidden), not
+    // the visible-preferred action pool.
     return {
       ok: true,
       selectorUsed: match.selectorUsed,
-      count: match.matches.length,
+      count: match.allMatches.length,
     }
   }
 
@@ -1542,17 +1592,43 @@ async function pageOps(command, args) {
     // Codex dom_cua.get_visible_dom — visible interactable nodes with node ids.
     const limit = Math.min(1000, Math.max(1, Number(options.limit) || 500))
     const nodes = []
-    let uidCounter = 0
+    // Seed the counter past every existing n-prefixed uid so freshly stamped
+    // elements never reuse ids still held by other elements (uidCounter used
+    // to restart at 0 each call → collisions with kept data-opc-uid values).
+    const usedUids = new Set()
+    let maxN = -1
+    document.querySelectorAll("[data-opc-uid]").forEach((el) => {
+      const v = el.getAttribute("data-opc-uid") || ""
+      if (!v) return
+      usedUids.add(v)
+      const m = v.match(/^n(\d+)$/)
+      if (m) {
+        const n = Number(m[1])
+        if (n > maxN) maxN = n
+      }
+    })
+    let uidCounter = maxN + 1
+    const emittedUids = new Set()
+    function nextFreshUid() {
+      let uid
+      do {
+        uid = `n${uidCounter++}`
+      } while (usedUids.has(uid) || emittedUids.has(uid))
+      return uid
+    }
     const interactive = document.querySelectorAll(
       "a, button, input, textarea, select, option, summary, [role='button'], [role='link'], [role='textbox'], [role='checkbox'], [role='radio'], [role='switch'], [role='menuitem'], [role='tab'], [role='option'], [contenteditable='true'], [tabindex]"
     )
     for (const el of interactive) {
       if (!isVisible(el)) continue
       let uid = el.getAttribute?.("data-opc-uid")
-      if (!uid) {
-        uid = `n${uidCounter++}`
+      // Uniqueness check: renumber duplicates already emitted this scan.
+      if (!uid || emittedUids.has(uid)) {
+        uid = nextFreshUid()
         el.setAttribute("data-opc-uid", uid)
       }
+      emittedUids.add(uid)
+      usedUids.add(uid)
       const rect = el.getBoundingClientRect()
       nodes.push({
         node_id: uid,
@@ -1569,10 +1645,11 @@ async function pageOps(command, args) {
   }
 
   if (command === "locator_all") {
-    // Codex locator.all() — resolve to list of element descriptors
+    // Codex locator.all() — resolve to list of element descriptors.
+    // Observation tool: enumerate every DOM match (incl. hidden).
     if (!selectors.length) return { ok: false, error: "Selector is required" }
     const match = await resolveMatches(selectors, 0, Math.max(0, timeoutMs || DEFAULT_TIMEOUT_MS), pollMs)
-    const items = match.matches.map((el, i) => ({
+    const items = match.allMatches.map((el, i) => ({
       index: i,
       uid: el.getAttribute?.("data-opc-uid") || null,
       tag: el.tagName?.toLowerCase() || "",
@@ -1580,14 +1657,18 @@ async function pageOps(command, args) {
       name: getAccessibleName(el).slice(0, 120),
       visible: isVisible(el),
     }))
-    return { ok: true, selectorUsed: match.selectorUsed, count: match.matches.length, items }
+    return { ok: true, selectorUsed: match.selectorUsed, count: match.allMatches.length, items }
   }
 
   if (command === "press") {
-    // Codex locator.press — focus selector then dispatch key event
+    // Codex locator.press — focus selector then dispatch key event(s).
+    // Supports keys: string[] as a chord (modifiers held while later keys fire).
     if (!selectors.length) return { ok: false, error: "Selector is required" }
-    const key = safeString(options.key || options.keys?.[0] || "")
-    if (!key) return { ok: false, error: "key is required" }
+    const keysList =
+      Array.isArray(options.keys) && options.keys.length
+        ? options.keys.map((k) => safeString(k)).filter(Boolean)
+        : [safeString(options.key || "")].filter(Boolean)
+    if (!keysList.length) return { ok: false, error: "key is required" }
     const match = await resolveActionMatch(selectors, index, timeoutMs, pollMs)
     if (match.ambiguous) return strictMatchError(match.selectorUsed, match.matches)
     if (!match.chosen) return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
@@ -1595,19 +1676,46 @@ async function pageOps(command, args) {
       match.chosen.focus()
     } catch {}
     const target = match.chosen
-    const code = key.length === 1 ? key : null
-    const eventInit = { bubbles: true, cancelable: true, key, code: code || key }
-    target.dispatchEvent(new KeyboardEvent("keydown", eventInit))
-    if (key.length === 1 && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
-      // approximate typing for printable char
-      const cur = target.isContentEditable ? target.innerText : target.value || ""
-      const next = cur + key
-      if (target.isContentEditable) target.innerText = next
-      else setNativeValue(target, next)
-      target.dispatchEvent(new Event("input", { bubbles: true }))
+    const MOD_FLAG = {
+      control: "ctrlKey",
+      ctrl: "ctrlKey",
+      shift: "shiftKey",
+      alt: "altKey",
+      option: "altKey",
+      meta: "metaKey",
+      cmd: "metaKey",
+      command: "metaKey",
     }
-    target.dispatchEvent(new KeyboardEvent("keyup", eventInit))
-    return { ok: true, selectorUsed: match.selectorUsed, key, uid: target.getAttribute?.("data-opc-uid") || null }
+    // US-layout shift mapping (see SHIFT_CHAR_MAP in the CDP path).
+    const SHIFT_CHARS = { "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(", "0": ")", "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|", ";": ":", "'": '"', ",": "<", ".": ">", "/": "?", "`": "~" }
+    const flags = { ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }
+    const downStack = []
+    for (const key of keysList) {
+      const modFlag = MOD_FLAG[key.toLowerCase()]
+      if (modFlag) flags[modFlag] = true
+      const eventInit = { bubbles: true, cancelable: true, key, code: key, ...flags }
+      target.dispatchEvent(new KeyboardEvent("keydown", eventInit))
+      downStack.push({ key, flags: { ...flags } })
+      if (key.length === 1 && !flags.ctrlKey && !flags.metaKey && !flags.altKey) {
+        let insertChar = key
+        if (flags.shiftKey) {
+          if (/^[a-z]$/i.test(key)) insertChar = key.toUpperCase()
+          else if (Object.prototype.hasOwnProperty.call(SHIFT_CHARS, key)) insertChar = SHIFT_CHARS[key]
+        }
+        if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) {
+          const cur = target.isContentEditable ? target.innerText : target.value || ""
+          const next = cur + insertChar
+          if (target.isContentEditable) target.innerText = next
+          else setNativeValue(target, next)
+          target.dispatchEvent(new Event("input", { bubbles: true }))
+        }
+      }
+    }
+    for (let i = downStack.length - 1; i >= 0; i--) {
+      const entry = downStack[i]
+      target.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key: entry.key, code: entry.key, ...entry.flags }))
+    }
+    return { ok: true, selectorUsed: match.selectorUsed, key: keysList[0], keys: keysList, uid: target.getAttribute?.("data-opc-uid") || null }
   }
 
   if (command === "mouse_move") {
@@ -1937,12 +2045,35 @@ async function pageOps(command, args) {
     // Codex Tab.content.export — contentType html | text | domSnapshot (text body)
     const contentType = typeof options.contentType === "string" ? options.contentType : "text"
     if (contentType === "html") {
+      let html = ""
+      if (document.documentElement) {
+        // Serialize a CLONE — never mutate the live DOM. Sensitive field
+        // values (password/hidden inputs, tokens, OTPs, etc.) are redacted
+        // before serialization so raw outerHTML can't leak secrets.
+        const clone = document.documentElement.cloneNode(true)
+        const fields = []
+        if (clone.nodeType === 1 && /^(INPUT|TEXTAREA|SELECT)$/.test(clone.tagName)) fields.push(clone)
+        const found = clone.querySelectorAll ? clone.querySelectorAll("input, textarea, select") : []
+        for (const el of found) fields.push(el)
+        for (const el of fields) {
+          if (!isSensitiveField(el)) continue
+          if (el.tagName === "SELECT") {
+            // value attribute not applicable to select — remove entirely.
+            el.removeAttribute("value")
+            continue
+          }
+          el.setAttribute("value", "[REDACTED]")
+          if (el.tagName === "TEXTAREA") el.textContent = "[REDACTED]"
+        }
+        html = clone.outerHTML
+      }
       return {
         ok: true,
         contentType,
-        value: document.documentElement ? document.documentElement.outerHTML : "",
+        value: html,
         title: document.title,
         url: location.href,
+        redacted: true,
       }
     }
     if (contentType === "text") {
@@ -1969,20 +2100,21 @@ async function pageOps(command, args) {
   }
 
   if (command === "all_text_contents") {
-    // Codex locator.allTextContents — all matches (not strict unique)
+    // Codex locator.allTextContents — all matches (not strict unique).
+    // Observation tool: include hidden matches, not just the visible-preferred pool.
     if (!selectors.length) return { ok: false, error: "Selector is required" }
     const limit = Math.min(500, Math.max(1, Number(options.limit) || 200))
     const match = await resolveMatches(selectors, 0, Math.max(0, timeoutMs || DEFAULT_TIMEOUT_MS), pollMs)
     const texts = []
-    for (const el of match.matches.slice(0, limit)) {
+    for (const el of match.allMatches.slice(0, limit)) {
       texts.push(el?.textContent == null ? "" : String(el.textContent))
     }
     return {
       ok: true,
       selectorUsed: match.selectorUsed,
-      count: match.matches.length,
+      count: match.allMatches.length,
       values: texts,
-      truncated: match.matches.length > limit,
+      truncated: match.allMatches.length > limit,
     }
   }
 
@@ -2622,11 +2754,39 @@ async function toolClick({ selector, tabId, index, timeoutMs, pollMs }) {
 
   const args = { selector, timeoutMs, pollMs }
   if (Number.isFinite(index)) args.index = index
+
+  // Resolution semantics (strict multi-match/index) stay in the page op;
+  // only the ACTIVATION becomes a trusted CDP mouse click at the element's
+  // viewport center (synthetic MouseEvents are isTrusted:false and are
+  // silently ignored by trusted-gated pages).
+  const point = await runInPage(tab.id, "resolve_point", args)
+  if (!point?.ok) throw new Error(formatActionError(point, "Click failed"))
+
+  const cdp = await cdpInputSession(tab.id)
+  if (cdp) {
+    await cdpDispatchMouse(tab.id, "mouseMoved", { x: point.x, y: point.y })
+    await cdpDispatchMouse(tab.id, "mousePressed", { x: point.x, y: point.y, button: "left", clickCount: 1 })
+    await cdpDispatchMouse(tab.id, "mouseReleased", { x: point.x, y: point.y, button: "left", clickCount: 1 })
+    const used = point.selectorUsed || selector
+    const uid = point.uid ? ` uid=${point.uid}` : ""
+    return { tabId: tab.id, content: `Clicked ${used}${uid}` }
+  }
+
+  // Debugger unavailable: keep the existing synthetic path, annotated.
   const result = await runInPage(tab.id, "click", args)
   if (!result?.ok) throw new Error(formatActionError(result, "Click failed"))
   const used = result.selectorUsed || selector
   const uid = result.uid ? ` uid=${result.uid}` : ""
-  return { tabId: tab.id, content: `Clicked ${used}${uid}` }
+  return {
+    tabId: tab.id,
+    content: JSON.stringify({
+      ok: true,
+      method: "synthetic",
+      degraded: true,
+      note: "debugger unavailable; dispatched synthetic (untrusted) click — trusted-gated pages may ignore it",
+      clicked: `${used}${uid}`,
+    }),
+  }
 }
 
 async function toolCount({ selector, tabId, timeoutMs, pollMs }) {
@@ -2697,11 +2857,37 @@ async function toolDblclick({ selector, tabId, index, timeoutMs, pollMs }) {
   const tab = await getTabById(tabId)
   const args = { selector, timeoutMs, pollMs }
   if (Number.isFinite(index)) args.index = index
+
+  // Resolve in-page, then activate with two trusted CDP clicks at the center.
+  const point = await runInPage(tab.id, "resolve_point", args)
+  if (!point?.ok) throw new Error(formatActionError(point, "Double-click failed"))
+
+  const cdp = await cdpInputSession(tab.id)
+  if (cdp) {
+    await cdpDispatchMouse(tab.id, "mouseMoved", { x: point.x, y: point.y })
+    await cdpDispatchMouse(tab.id, "mousePressed", { x: point.x, y: point.y, button: "left", clickCount: 1 })
+    await cdpDispatchMouse(tab.id, "mouseReleased", { x: point.x, y: point.y, button: "left", clickCount: 1 })
+    await cdpDispatchMouse(tab.id, "mousePressed", { x: point.x, y: point.y, button: "left", clickCount: 2 })
+    await cdpDispatchMouse(tab.id, "mouseReleased", { x: point.x, y: point.y, button: "left", clickCount: 2 })
+    const used = point.selectorUsed || selector
+    const uid = point.uid ? ` uid=${point.uid}` : ""
+    return { tabId: tab.id, content: `Double-clicked ${used}${uid}` }
+  }
+
   const result = await runInPage(tab.id, "dblclick", args)
   if (!result?.ok) throw new Error(formatActionError(result, "Double-click failed"))
   const used = result.selectorUsed || selector
   const uid = result.uid ? ` uid=${result.uid}` : ""
-  return { tabId: tab.id, content: `Double-clicked ${used}${uid}` }
+  return {
+    tabId: tab.id,
+    content: JSON.stringify({
+      ok: true,
+      method: "synthetic",
+      degraded: true,
+      note: "debugger unavailable; dispatched synthetic (untrusted) dblclick — trusted-gated pages may ignore it",
+      clicked: `${used}${uid}`,
+    }),
+  }
 }
 
 async function toolCheck({ selector, tabId, index, timeoutMs, pollMs }) {
@@ -3009,6 +3195,11 @@ async function toolSelect({ selector, value, label, optionIndex, tabId, index, t
 }
 
 async function toolScreenshot({ tabId, fullPage = false, clip } = {}) {
+  // Any present tabId (explicit or broker-defaulted) counts as a SPECIFIED
+  // target: always capture via CDP Page.captureScreenshot and never consult
+  // tab.active (TOCTOU — the user can switch tabs between check and capture,
+  // and captureVisibleTab would silently return the wrong tab's image).
+  const specified = tabId !== undefined && tabId !== null
   const tab = await getTabById(tabId)
   const wantFull = fullPage === true
   const hasClip =
@@ -3018,79 +3209,46 @@ async function toolScreenshot({ tabId, fullPage = false, clip } = {}) {
     Number.isFinite(clip.width) &&
     Number.isFinite(clip.height)
 
-  // chrome.tabs.captureVisibleTab always captures the window's ACTIVE tab.
-  // A background target tab must go through CDP Page.captureScreenshot.
-  const isActiveTab = tab.active === true
-  const needCdp = wantFull || hasClip || !isActiveTab
+  const needCdp = specified || wantFull || hasClip
 
-  // Codex ScreenshotOptions: fullPage / clip — prefer CDP when needed
-  if (needCdp) {
-    const state = await ensureDebuggerAttached(tab.id)
-    if (!state?.attached) {
-      if (!isActiveTab) {
-        throw new Error(
-          state?.unavailableReason
-            ? `cannot screenshot background tab without debugger: ${state.unavailableReason}`
-            : "cannot screenshot background tab without debugger"
-        )
-      }
-      if (wantFull) {
-        throw new Error(
-          state?.unavailableReason
-            ? `fullPage screenshot requires debugger: ${state.unavailableReason}`
-            : "fullPage screenshot requires chrome.debugger"
-        )
-      }
-      // clip-only without debugger: capture visible then note clip unsupported
-      const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
-      return {
-        tabId: tab.id,
-        content: png,
-        note: "clip ignored without debugger; returned viewport capture",
-      }
-    }
-
-    const params = { format: "png", fromSurface: true }
-    if (wantFull) params.captureBeyondViewport = true
-    if (hasClip) {
-      params.clip = {
-        x: clip.x,
-        y: clip.y,
-        width: clip.width,
-        height: clip.height,
-        scale: 1,
-      }
-    }
-
-    let remote
-    try {
-      remote = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.captureScreenshot", params)
-    } catch (e) {
-      if (!isActiveTab) {
-        // Never fall back to captureVisibleTab for a background tab — it would
-        // silently capture the wrong (active) tab.
-        throw new Error(`cannot screenshot background tab without debugger: CDP capture failed (${e?.message || e})`)
-      }
-      // fallback: viewport capture if CDP path fails
-      try {
-        const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
-        return {
-          tabId: tab.id,
-          content: png,
-          note: `CDP capture failed (${e?.message || e}); returned viewport`,
-        }
-      } catch {
-        throw new Error(e?.message || String(e) || "screenshot failed")
-      }
-    }
-    const b64 = remote?.data
-    if (!b64) throw new Error("screenshot failed: empty CDP data")
-    return { tabId: tab.id, content: `data:image/png;base64,${b64}` }
+  if (!needCdp) {
+    // captureVisibleTab is acceptable ONLY here: no tabId was specified at
+    // all — a true "whatever is active" plain viewport capture.
+    const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
+    return { tabId: tab.id, content: png }
   }
 
-  // Plain viewport capture — only when the target tab IS the active tab.
-  const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
-  return { tabId: tab.id, content: png }
+  const state = await ensureDebuggerAttached(tab.id)
+  if (!state?.attached) {
+    const reason = state?.unavailableReason || "debugger attach failed"
+    // Never fall back to captureVisibleTab for a specified tabId, and never
+    // silently degrade a requested clip to a full-viewport capture.
+    if (hasClip) throw new Error(`clip screenshot requires debugger (clip would be silently ignored otherwise): ${reason}`)
+    if (wantFull) throw new Error(`fullPage screenshot requires debugger: ${reason}`)
+    throw new Error(`screenshot of specified tab requires debugger: ${reason}`)
+  }
+
+  const params = { format: "png", fromSurface: true }
+  if (wantFull) params.captureBeyondViewport = true
+  if (hasClip) {
+    params.clip = {
+      x: clip.x,
+      y: clip.y,
+      width: clip.width,
+      height: clip.height,
+      scale: 1,
+    }
+  }
+
+  let remote
+  try {
+    remote = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.captureScreenshot", params)
+  } catch (e) {
+    throw new Error(`CDP Page.captureScreenshot failed: ${e?.message || e}`)
+  }
+  const b64 = remote?.data
+  if (!b64) throw new Error("screenshot failed: empty CDP data")
+  return { tabId: tab.id, content: `data:image/png;base64,${b64}` }
 }
 
 /** Prefer MV3 offscreen document for clipboard (no page focus required). */
@@ -3453,8 +3611,15 @@ async function toolLocatorAll({ selector, tabId, timeoutMs, pollMs } = {}) {
 
 async function toolPress({ selector, key, keys, tabId, index, timeoutMs, pollMs } = {}) {
   if (!selector) throw new Error("Selector is required")
-  const k = key || (Array.isArray(keys) && keys.length ? keys[0] : null)
-  if (!k) throw new Error("key is required (Codex locator.press)")
+  // keys: string[] is a full chord/combo (e.g. ["Control","a"] = Ctrl+A);
+  // entries Control/Ctrl/Shift/Alt/Option/Meta/Cmd/Command act as modifiers.
+  const keyList =
+    Array.isArray(keys) && keys.length
+      ? keys.map((k) => String(k)).filter(Boolean)
+      : key != null && String(key) !== ""
+        ? [String(key)]
+        : []
+  if (!keyList.length) throw new Error("key is required (Codex locator.press)")
   const tab = await getTabById(tabId)
 
   // Trusted CDP keyboard path (see toolKey).
@@ -3462,14 +3627,19 @@ async function toolPress({ selector, key, keys, tabId, index, timeoutMs, pollMs 
   if (cdp) {
     const focused = await runInPage(tab.id, "focus", { selector, index, timeoutMs, pollMs })
     if (!focused?.ok) throw new Error(formatActionError(focused, "press failed"))
-    const info = cdpKeyInfo(k)
-    await cdpKeyPress(tab.id, info, {})
+    if (keyList.length === 1) {
+      const info = cdpKeyInfo(keyList[0])
+      await cdpKeyPress(tab.id, info, {})
+    } else {
+      await cdpKeyChord(tab.id, keyList)
+    }
     return {
       tabId: tab.id,
       content: JSON.stringify({
         ok: true,
         selectorUsed: focused.selectorUsed,
-        key: k,
+        key: keyList[0],
+        keys: keyList,
         uid: focused.uid ?? null,
         method: "cdp",
       }),
@@ -3478,7 +3648,8 @@ async function toolPress({ selector, key, keys, tabId, index, timeoutMs, pollMs 
 
   const result = await runInPage(tab.id, "press", {
     selector,
-    key: k,
+    key: keyList[0],
+    keys: keyList,
     index,
     timeoutMs,
     pollMs,
@@ -3491,9 +3662,22 @@ async function toolPress({ selector, key, keys, tabId, index, timeoutMs, pollMs 
 // Falls back to in-page synthetic dispatchEvent when the debugger is unavailable.
 
 const CDP_MOUSE_BUTTONS = { 1: "left", 2: "middle", 3: "right", 4: "back", 5: "forward" }
-// CDP `buttons` bitmask (Left=1, Right=2, Middle=4, Back=16, Forward=32).
+// CDP `buttons` bitmask per spec: Left=1, Right=2, Middle=4, Back=8, Forward=16.
 // mousePressed without `buttons` is silently dropped by some Chrome builds.
-const CDP_BUTTONS_MASK = { left: 1, right: 2, middle: 4, back: 16, forward: 32, none: 0 }
+const CDP_BUTTONS_MASK = { left: 1, right: 2, middle: 4, back: 8, forward: 16, none: 0 }
+
+// Persistent per-tab CDP mouse state: tabId -> { x, y, buttons, button }.
+// Lets mouseMoved report the currently held buttons (e.g. mid-drag).
+const cdpMouseState = new Map()
+
+function getCdpMouseState(tabId) {
+  let state = cdpMouseState.get(tabId)
+  if (!state) {
+    state = { x: 0, y: 0, buttons: 0, button: "none" }
+    cdpMouseState.set(tabId, state)
+  }
+  return state
+}
 
 function cdpModifierMask(keypress) {
   if (!Array.isArray(keypress)) return 0
@@ -3516,12 +3700,28 @@ async function cdpInputSession(tabId) {
 }
 
 async function cdpDispatchMouse(tabId, type, { x, y, button = "none", clickCount = 0, modifiers = 0, buttons } = {}) {
-  const buttonsMask = buttons ?? (type === "mousePressed" ? CDP_BUTTONS_MASK[button] ?? 0 : 0)
+  const state = getCdpMouseState(tabId)
+  if (Number.isFinite(x)) state.x = x
+  if (Number.isFinite(y)) state.y = y
+  // Keep the persistent button state in sync: pressed sets the bit (included
+  // in the press event itself), released clears it before the release event,
+  // and mouseMoved simply reports the current held buttons.
+  if (type === "mousePressed" && button !== "none") {
+    state.buttons |= CDP_BUTTONS_MASK[button] ?? 0
+    state.button = button
+  } else if (type === "mouseReleased" && button !== "none") {
+    state.buttons &= ~(CDP_BUTTONS_MASK[button] ?? 0)
+    if (!state.buttons) state.button = "none"
+  }
+  const buttonsMask = buttons ?? state.buttons
+  // While a button is held (e.g. after press, before release in a drag),
+  // mouseMoved must carry that button so the page sees a real drag.
+  const effectiveButton = button !== "none" ? button : state.button
   await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
     type,
     x,
     y,
-    button,
+    button: effectiveButton,
     buttons: buttonsMask,
     clickCount,
     modifiers,
@@ -3585,25 +3785,131 @@ async function cdpDispatchKey(
   await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", params)
 }
 
-/** Full trusted key press: rawKeyDown (+ char for text-producing keys), then keyUp. */
-async function cdpKeyPress(tabId, info, { modifiers = 0, autoRepeat = false, delayMs = 0 } = {}) {
-  const printable = typeof info.key === "string" && info.key.length === 1
+// US-layout shift mapping for digits/punctuation.
+// LIMITATION: assumes a US keyboard layout; other layouts map shifted
+// digit/punct keys differently (e.g. Shift+2 is `"` on UK layouts).
+const SHIFT_CHAR_MAP = {
+  "1": "!",
+  "2": "@",
+  "3": "#",
+  "4": "$",
+  "5": "%",
+  "6": "^",
+  "7": "&",
+  "8": "*",
+  "9": "(",
+  "0": ")",
+  "-": "_",
+  "=": "+",
+  "[": "{",
+  "]": "}",
+  "\\": "|",
+  ";": ":",
+  "'": '"',
+  ",": "<",
+  ".": ">",
+  "/": "?",
+  "`": "~",
+}
+
+// CDP modifier mask bits: Alt=1, Ctrl=2, Meta=4, Shift=8.
+const CDP_MASK_NON_SHIFT = 1 | 2 | 4
+const CDP_MASK_SHIFT = 8
+
+/**
+ * Resolve the effective key/text for a key press given the CDP modifier mask.
+ * - Shift+letter/digit/punct: key and text become the SHIFTED char
+ *   (Shift+a → key "A", text "A", unmodifiedText "a"); code stays (KeyA).
+ * - Any of Ctrl/Meta/Alt held: accelerator — no char event, no text at all.
+ */
+function resolveKeyText(info, modifiers) {
+  const key = typeof info.key === "string" ? info.key : ""
+  if (modifiers & CDP_MASK_NON_SHIFT) {
+    return { info, text: null, unmodifiedText: null }
+  }
+  if (key.length === 1) {
+    if (modifiers & CDP_MASK_SHIFT) {
+      let shifted = key
+      if (/^[a-z]$/i.test(key)) shifted = key.toUpperCase()
+      else if (Object.prototype.hasOwnProperty.call(SHIFT_CHAR_MAP, key)) shifted = SHIFT_CHAR_MAP[key]
+      const unmodified = /^[a-z]$/i.test(key) ? key.toLowerCase() : key
+      return { info: { ...info, key: shifted }, text: shifted, unmodifiedText: unmodified }
+    }
+    return { info, text: key, unmodifiedText: key }
+  }
   // Enter must emit a char ("\r") — implicit form submission / keypress default
   // actions trigger on the char event, not on rawKeyDown.
-  const charText = printable ? info.key : info.key === "Enter" ? "\r" : null
-  await cdpDispatchKey(tabId, { type: "rawKeyDown", ...info, modifiers, autoRepeat })
-  if (charText !== null) {
+  if (key === "Enter") return { info, text: "\r", unmodifiedText: "\r" }
+  return { info, text: null, unmodifiedText: null }
+}
+
+/** Full trusted key press: rawKeyDown/keyDown (+ char for text-producing keys), then keyUp. */
+async function cdpKeyPress(tabId, info, { modifiers = 0, autoRepeat = false, delayMs = 0 } = {}) {
+  const resolved = resolveKeyText(info, modifiers)
+  // Text-producing keys keep rawKeyDown+char. Non-text keys must use "keyDown":
+  // on macOS, rawKeyDown skips keyEquivalent handling, so accelerators
+  // (Cmd+A, Ctrl+C, …) never fire from a raw event.
+  await cdpDispatchKey(tabId, { type: resolved.text !== null ? "rawKeyDown" : "keyDown", ...resolved.info, modifiers, autoRepeat })
+  if (resolved.text !== null) {
     await cdpDispatchKey(tabId, {
       type: "char",
-      ...info,
+      ...resolved.info,
       modifiers,
-      text: charText,
-      unmodifiedText: charText,
+      text: resolved.text,
+      unmodifiedText: resolved.unmodifiedText,
       autoRepeat,
     })
   }
   if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
-  await cdpDispatchKey(tabId, { type: "keyUp", ...info, modifiers })
+  await cdpDispatchKey(tabId, { type: "keyUp", ...resolved.info, modifiers })
+}
+
+const CDP_MODIFIER_KEY_INFO = {
+  Alt: { code: "AltLeft", windowsVirtualKeyCode: 18, nativeVirtualKeyCode: 18 },
+  Control: { code: "ControlLeft", windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17 },
+  Meta: { code: "MetaLeft", windowsVirtualKeyCode: 91, nativeVirtualKeyCode: 91 },
+  Shift: { code: "ShiftLeft", windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16 },
+}
+
+function normalizeCdpModifierKey(name) {
+  const n = String(name).trim().toLowerCase()
+  if (n === "control" || n === "ctrl") return "Control"
+  if (n === "shift") return "Shift"
+  if (n === "alt" || n === "option") return "Alt"
+  if (n === "meta" || n === "cmd" || n === "command") return "Meta"
+  return null
+}
+
+/**
+ * Chord/combo press (e.g. ["Control","a"] = Ctrl+A): press all keys down in
+ * order with cumulative modifiers (Control/Shift/Alt/Meta aliases are treated
+ * as modifiers, not character keys), then release in reverse order.
+ */
+async function cdpKeyChord(tabId, keyList) {
+  let modifiers = 0
+  const downStack = []
+  for (const raw of keyList) {
+    const modKey = normalizeCdpModifierKey(raw)
+    if (modKey) modifiers |= cdpModifierMask([modKey])
+    const baseInfo = modKey ? { key: modKey, ...CDP_MODIFIER_KEY_INFO[modKey] } : cdpKeyInfo(String(raw))
+    const resolved = modKey ? { info: baseInfo, text: null, unmodifiedText: null } : resolveKeyText(baseInfo, modifiers)
+    // See cdpKeyPress: non-text keys need "keyDown" so accelerators fire on macOS.
+    await cdpDispatchKey(tabId, { type: resolved.text !== null ? "rawKeyDown" : "keyDown", ...resolved.info, modifiers })
+    if (resolved.text !== null) {
+      await cdpDispatchKey(tabId, {
+        type: "char",
+        ...resolved.info,
+        modifiers,
+        text: resolved.text,
+        unmodifiedText: resolved.unmodifiedText,
+      })
+    }
+    downStack.push({ info: resolved.info, modifiers })
+  }
+  for (let i = downStack.length - 1; i >= 0; i--) {
+    const entry = downStack[i]
+    await cdpDispatchKey(tabId, { type: "keyUp", ...entry.info, modifiers: entry.modifiers })
+  }
 }
 
 async function toolMouseMove({ x, y, tabId } = {}) {

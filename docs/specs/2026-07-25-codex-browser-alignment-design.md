@@ -1,7 +1,7 @@
 # OpenCode Browser ↔ Codex Chrome 能力对齐设计
 
 **日期:** 2026-07-25  
-**仓库:** `ageless-h/opencode-browser`（基于 `@different-ai/opencode-browser@4.6.1`）  
+**仓库:** `ageless-h/opencode-browser`（fork 自 `@different-ai/opencode-browser@4.6.1`）  
 **状态:** 已批准执行（路线 B）
 
 ## 1. 目标

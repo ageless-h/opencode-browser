@@ -13290,9 +13290,9 @@ function createAgentBackend(sessionId) {
 }
 
 // src/plugin.ts
-import { appendFileSync, existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync2, statSync } from "fs";
-import { homedir as homedir2, userInfo } from "os";
-import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "path";
+import { appendFileSync, existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync2, realpathSync, statSync } from "fs";
+import { homedir as homedir2, tmpdir as tmpdir2, userInfo } from "os";
+import { basename as basename2, dirname as dirname2, extname, isAbsolute as isAbsolute2, join as join2, relative, resolve as resolve2, sep } from "path";
 import { spawn as spawn2 } from "child_process";
 import { fileURLToPath } from "url";
 var __filename2 = fileURLToPath(import.meta.url);
@@ -13354,8 +13354,85 @@ function resolveUploadPath(filePath) {
     throw new Error("filePath is required");
   return isAbsolute2(trimmed) ? trimmed : resolve2(process.cwd(), trimmed);
 }
+var BLOCKED_UPLOAD_BASENAMES = new Set(["id_rsa", "id_ed25519"]);
+var BLOCKED_UPLOAD_EXTENSIONS = new Set([".pem", ".key"]);
+var ENV_FILE_SEGMENT_RE = /^\.env($|\.)/i;
+function isPathWithin(child, parent) {
+  const rel = relative(parent, child);
+  return rel === "" || !rel.startsWith("..") && !isAbsolute2(rel);
+}
+function realpathOrSelf(p) {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+function getBlockedUploadDirs() {
+  const home = homedir2();
+  const raw = [
+    join2(home, ".ssh"),
+    join2(home, ".aws"),
+    join2(home, ".gnupg"),
+    join2(home, ".config", "opencode"),
+    join2(home, ".opencode-browser"),
+    join2(home, "Library", "Keychains")
+  ];
+  const dirs = new Set;
+  for (const dir of raw) {
+    dirs.add(dir);
+    dirs.add(realpathOrSelf(dir));
+  }
+  return [...dirs];
+}
+function getAllowedUploadRoots() {
+  const roots = [process.cwd(), tmpdir2()];
+  const extra = process.env.OPENCODE_BROWSER_UPLOAD_DIRS;
+  if (extra) {
+    for (const part of extra.split(":")) {
+      const dir = part.trim();
+      if (dir && isAbsolute2(dir))
+        roots.push(dir);
+    }
+  }
+  const out = [];
+  for (const root of roots) {
+    const real = realpathOrSelf(root);
+    if (!out.includes(real))
+      out.push(real);
+  }
+  return out;
+}
+function assertUploadAllowed(absPath) {
+  let real;
+  try {
+    real = realpathSync(absPath);
+  } catch {
+    throw new Error(`Cannot read file: ${absPath}`);
+  }
+  for (const blockedDir of getBlockedUploadDirs()) {
+    if (isPathWithin(real, blockedDir)) {
+      throw new Error(`Refusing to read sensitive path: ${real}. This location is always blocked ` + `(credential/config directories such as ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/opencode, ` + `~/.opencode-browser, ~/Library/Keychains) regardless of upload boundary settings.`);
+    }
+  }
+  const segments = real.split(sep);
+  for (const segment of segments) {
+    if (ENV_FILE_SEGMENT_RE.test(segment)) {
+      throw new Error(`Refusing to read sensitive file: ${real}. Paths containing .env files are always blocked.`);
+    }
+  }
+  const base = basename2(real).toLowerCase();
+  if (BLOCKED_UPLOAD_BASENAMES.has(base) || BLOCKED_UPLOAD_EXTENSIONS.has(extname(base))) {
+    throw new Error(`Refusing to read sensitive file: ${real}. Private keys and certificate files ` + `(id_rsa, id_ed25519, *.pem, *.key) are always blocked.`);
+  }
+  const roots = getAllowedUploadRoots();
+  if (!roots.some((root) => isPathWithin(real, root))) {
+    throw new Error(`Refusing to read file outside the allowed upload boundary: ${real}. ` + `Allowed roots: the workspace (${realpathOrSelf(process.cwd())}) and the OS temp dir (${realpathOrSelf(tmpdir2())}). ` + `To allow this file, move it into the workspace or set OPENCODE_BROWSER_UPLOAD_DIRS ` + `(colon-separated absolute directories).`);
+  }
+  return real;
+}
 function buildFileUploadPayload(filePath, fileName, mimeType) {
-  const absPath = resolveUploadPath(filePath);
+  const absPath = assertUploadAllowed(resolveUploadPath(filePath));
   const stats = statSync(absPath);
   if (!stats.isFile())
     throw new Error(`Not a file: ${absPath}`);
@@ -13492,6 +13569,37 @@ function toolResultText(data, fallback) {
   if (data?.content != null)
     return JSON.stringify(data.content);
   return fallback;
+}
+function screenshotResultText(data, fallback) {
+  const content = data?.content;
+  if (typeof content === "string") {
+    const trimmed = content.trimStart();
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object") {
+          const meta = [];
+          if (parsed.method != null)
+            meta.push(`method: ${parsed.method}`);
+          if (parsed.degraded != null)
+            meta.push(`degraded: ${parsed.degraded}`);
+          if (parsed.note != null)
+            meta.push(`note: ${parsed.note}`);
+          const image = typeof parsed.data === "string" ? parsed.data : typeof parsed.content === "string" ? parsed.content : null;
+          if (meta.length > 0) {
+            return image ? `${image}
+[${meta.join(", ")}]` : `[${meta.join(", ")}]`;
+          }
+        }
+      } catch {}
+    }
+    return content;
+  }
+  const text = toolResultText(data, fallback);
+  if (typeof data?.note === "string" && data.note)
+    return `${text}
+[note: ${data.note}]`;
+  return text;
 }
 async function toolRequest(toolName, args) {
   if (USE_AGENT_BACKEND) {
@@ -14086,7 +14194,7 @@ var plugin = async (ctx) => {
         },
         async execute({ tabId, fullPage, clip }, ctx2) {
           const data = await toolRequest("screenshot", { tabId, fullPage, clip });
-          return toolResultText(data, "Screenshot failed");
+          return screenshotResultText(data, "Screenshot failed");
         }
       }),
       browser_clipboard_read_text: tool({
@@ -14444,7 +14552,7 @@ var plugin = async (ctx) => {
         }
       }),
       browser_set_file_input: tool({
-        description: "Set a file input's selected file via local path. selector supports locators (uid:/…); " + "omit index for strict unique match.",
+        description: "HIGH SENSITIVITY: reads a local file and uploads it into a web page. " + "Set a file input's selected file via local path. selector supports locators (uid:/…); " + "omit index for strict unique match. " + "File reads are restricted: by default only files under the current workspace " + "(process.cwd()) and the OS temp dir are allowed; extra roots can be added via the " + "OPENCODE_BROWSER_UPLOAD_DIRS env var (colon-separated absolute dirs). Credential " + "locations (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/opencode, ~/.opencode-browser, " + "~/Library/Keychains), .env files, and key files (id_rsa, id_ed25519, *.pem, *.key) " + "are always refused. Only upload files the user explicitly asked to upload.",
         args: {
           selector: schema.string(),
           filePath: schema.string(),
@@ -14457,7 +14565,15 @@ var plugin = async (ctx) => {
         },
         async execute({ selector, filePath, fileName, mimeType, index, tabId, timeoutMs, pollMs }, ctx2) {
           if (USE_AGENT_BACKEND) {
-            const data2 = await toolRequest("set_file_input", { selector, filePath, tabId, index, timeoutMs, pollMs });
+            const allowedPath = assertUploadAllowed(resolveUploadPath(filePath));
+            const data2 = await toolRequest("set_file_input", {
+              selector,
+              filePath: allowedPath,
+              tabId,
+              index,
+              timeoutMs,
+              pollMs
+            });
             return toolResultText(data2, "Set file input");
           }
           const file2 = buildFileUploadPayload(filePath, fileName, mimeType);

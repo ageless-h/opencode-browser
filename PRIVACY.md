@@ -1,51 +1,105 @@
 # OpenCode Browser Privacy Policy
 
-Last updated: 2026-02-10
+Last updated: 2026-07-25
 
-OpenCode Browser is a companion extension for the OpenCode plugin. It automates browser actions based on user requests.
+OpenCode Browser is a browser automation stack for OpenCode: an OpenCode plugin,
+a local broker, a Chrome Native Messaging host, and a Chrome/Chromium extension.
+It executes browser actions requested through OpenCode on your local machine.
 
-## What data the extension can access
+## 1. What the extension and plugin can access
 
-Depending on granted permissions and the sites you allow, the extension can access:
+Capabilities depend on the browser permissions granted and the build you installed.
+"Required" / "Optional" below compares the unpacked (developer) build with the
+Chrome Web Store (CWS) build, where several permissions become optional and
+`<all_urls>` host access moves to `optional_host_permissions`.
 
-- Website content (DOM text, element attributes, links, forms)
-- User activity related to requested automation steps (clicks, typing, selection)
-- Screenshots and page snapshots requested by the user
-- Download metadata for files initiated by automation
-- Optional diagnostics data (console messages and page errors) when debugger permission is granted
+| Permission / Capability | Tools using it | Data category | Unpacked build | CWS build |
+| --- | --- | --- | --- | --- |
+| `debugger` (CDP) | `browser_screenshot` (fullPage/clip/background tabs), `browser_console`, `browser_errors`, `browser_handle_dialog`, CDP mouse/keyboard input (`browser_mouse_*`, `browser_key`, `browser_drag`) | Screenshots, console messages, JS errors, trusted input events | Required | Optional |
+| `history` | `browser_history` | Browsing history (URLs, titles, visit times) | Required | Required |
+| `clipboardRead` | `browser_clipboard_read_text` | Clipboard text contents | Required | Required |
+| `clipboardWrite` | `browser_clipboard_write_text` | Writes text to clipboard | Required | Required |
+| `downloads` | `browser_download`, `browser_list_downloads`, `browser_download_media` | Download metadata and initiated downloads | Required | Optional |
+| `nativeMessaging` | All tools (bridge between extension and local broker/plugin) | Tool commands and results | Required | Optional |
+| `<all_urls>` host access + `scripting` | `browser_snapshot`, `browser_query`, `browser_export`, `browser_evaluate`, `browser_get_visible_dom`, form tools (`browser_click`, `browser_type`, `browser_fill`, `browser_select`, …) | Page content: DOM text, attributes, form values, links | Required | Optional (host access) |
+| `tabs` / `activeTab` / `tabGroups` | `browser_get_tabs`, `browser_open_tab`, `browser_close_tab`, `browser_navigate`, `browser_url`, `browser_title`, session grouping tools | Tab URLs, titles, and tab metadata | Required | Required |
+| `offscreen` | Clipboard offscreen document | Clipboard read/write without page focus | Required | Required |
+| `storage` / `alarms` / `notifications` | Internal plumbing only (state, keep-alive, status notices) | Extension-internal state | Required | `notifications` dropped; rest required |
+| Local file read (plugin-side, no browser permission) | `browser_set_file_input` | Contents of local files uploaded into web pages | N/A | N/A |
+| Arbitrary page JavaScript | `browser_evaluate` | Anything page JS can reach: DOM, cookies, localStorage, network requests | Required (via `scripting`) | Optional (host access) |
 
-## How data is used
+### Local file reading (`browser_set_file_input`)
 
-- Data is used only to execute the browser automation commands requested by the user.
-- Data is passed to a local native messaging host (`com.opencode.browser_automation`) and local OpenCode plugin processes.
-- The extension does not include third-party analytics SDKs or ad trackers.
+The plugin reads local files to satisfy file-upload requests. Fails closed:
 
-## Data sharing
+- Default boundary: only files under the current workspace (`process.cwd()`) and
+  the OS temp directory are readable. Paths are resolved with `realpathSync` and
+  the boundary is enforced after symlink resolution.
+- Extra roots can be added with the `OPENCODE_BROWSER_UPLOAD_DIRS` environment
+  variable (colon-separated absolute directories).
+- Always refused, even inside allowed roots: `~/.ssh`, `~/.aws`, `~/.gnupg`,
+  `~/.config/opencode`, `~/.opencode-browser`, `~/Library/Keychains`, any
+  `.env*` path segment, and files named `id_rsa`, `id_ed25519`, `*.pem`, `*.key`.
+- Size limit defaults to 512 KiB (`OPENCODE_BROWSER_MAX_UPLOAD_BYTES`).
 
-- The extension itself does not sell personal data.
-- The extension itself does not transfer data to unrelated third parties.
-- If you use OpenCode with remote models or services, data you request OpenCode to process may be sent by OpenCode according to your OpenCode configuration.
+## 2. Data flow
 
-## Data retention
+- Tool results (screenshots, page text, snapshots, history entries, clipboard
+  text, uploaded file contents) are returned to the OpenCode agent.
+- From there they are processed by whatever model provider you configured in
+  OpenCode. If that provider is remote, this data — including browsing history,
+  clipboard contents, file contents, and page data — is sent to that provider
+  under your OpenCode configuration. The extension/plugin does not choose or
+  contact any model provider itself.
+- Local-only components: the broker (`bin/broker.cjs`) and the native messaging
+  host (`bin/native-host.cjs`) communicate over a local unix socket / named pipe
+  and Chrome Native Messaging. They make no network connections.
+- The extension contains no third-party analytics SDKs or ad trackers and does
+  not send data to the extension authors.
+
+## 3. Sensitive-field redaction
+
+Snapshot, `page_text`, visible-DOM, and export paths redact values of sensitive
+form fields by default: inputs of type `password` or `hidden`, fields with
+`autocomplete` values such as `current-password` / `new-password` /
+`one-time-code`, and fields whose name/id match patterns like `passw`, `pwd`,
+`token`, `secret`, `api-key`, `otp`, `csrf`, `session`.
+
+Limits: redaction is heuristic and only applies to structured extraction tools.
+`browser_evaluate` runs arbitrary JavaScript and is not redacted; screenshots
+capture whatever is visually on screen; visible (non-redacted) page text may
+still contain secrets displayed by the site.
+
+## 4. User control
+
+- Revoke browser permissions any time in `chrome://extensions` (CWS build:
+  optional permissions and site access can be removed individually).
+- Uninstall everything with `npx @ageless-h/opencode-browser uninstall`, then
+  remove the extension in `chrome://extensions` and the plugin from your
+  OpenCode configuration.
+- Permission model difference: the unpacked build requests all permissions up
+  front; the CWS build marks `debugger`, `downloads`, and `nativeMessaging`
+  optional, moves `<all_urls>` host access to optional, and drops
+  `notifications`. Some tools fail with a clear error until the matching
+  optional permission is granted.
+- Prompt-injection boundary: page content can contain instructions aimed at the
+  agent. Prefer dedicated action tools (`browser_click`, `browser_type`,
+  `browser_fill`, `browser_select`), which act on specific elements.
+  `browser_evaluate` executes arbitrary JavaScript with full side-effect
+  capability — treat it as untrusted-territory and use it only when no dedicated
+  tool suffices.
+
+## 5. Data retention
 
 - Most data is processed in memory for the active automation session.
-- Console/error buffers are in-memory rolling buffers and are cleared when tabs close, extension restarts, or when explicitly cleared by tool calls.
-- Native host configuration files are stored locally on the machine for installation and runtime setup.
-
-## User controls
-
-- You can remove optional permissions at any time in `chrome://extensions`.
-- You can uninstall the extension and native host at any time.
-- You can disable or remove the OpenCode plugin from your OpenCode configuration.
-
-## Security model
-
-- Native messaging traffic stays on the local machine between Chrome and the local native host.
-- The extension requires explicit permissions and site access.
+- Console/error buffers are in-memory rolling buffers, cleared when tabs close,
+  the extension restarts, or they are explicitly cleared by tool calls.
+- Native host configuration files are stored locally for installation/runtime
+  setup. The plugin writes a local log at `~/.opencode-browser/plugin.log`.
 
 ## Contact
 
 Questions or concerns:
 
-- Project: https://github.com/different-ai/opencode-browser
-- Issues: https://github.com/different-ai/opencode-browser/issues
+- Project: https://github.com/ageless-h/opencode-browser
+- Issues: https://github.com/ageless-h/opencode-browser/issues

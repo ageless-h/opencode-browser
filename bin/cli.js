@@ -21,6 +21,12 @@ import {
   unlinkSync,
   chmodSync,
   renameSync,
+  lstatSync,
+  statSync,
+  realpathSync,
+  openSync,
+  closeSync,
+  fsyncSync,
 } from "fs";
 import { homedir, platform, userInfo } from "os";
 import { join, dirname, basename } from "path";
@@ -57,12 +63,69 @@ function getPluginConfigValue() {
 }
 
 function writeFileAtomic(filePath, contents) {
+  // Symlinks: atomically replace the REAL target, never the link itself.
+  let targetPath = filePath;
+  try {
+    if (lstatSync(filePath).isSymbolicLink()) {
+      targetPath = realpathSync(filePath);
+    }
+  } catch {
+    // target does not exist yet; write to the requested path
+  }
+
+  const targetDir = dirname(targetPath);
   const tmpPath = join(
-    dirname(filePath),
-    `.${basename(filePath)}.tmp-${process.pid}-${Date.now()}`
+    targetDir,
+    `.${basename(targetPath)}.tmp-${process.pid}-${Date.now()}`
   );
-  writeFileSync(tmpPath, contents);
-  renameSync(tmpPath, filePath);
+
+  // Preserve the existing file's mode; brand-new files (which may hold API
+  // keys) start private at 0600.
+  let intendedMode = 0o600;
+  try {
+    intendedMode = statSync(targetPath).mode & 0o777;
+  } catch {}
+
+  let fd = null;
+  try {
+    fd = openSync(tmpPath, "w", intendedMode);
+    writeFileSync(fd, contents);
+    try {
+      // umask may have stripped bits at creation; enforce the intended mode.
+      chmodSync(tmpPath, intendedMode);
+    } catch {}
+    try {
+      fsyncSync(fd);
+    } catch {}
+    closeSync(fd);
+    fd = null;
+    renameSync(tmpPath, targetPath);
+    // Best-effort: flush the directory entry to disk.
+    try {
+      const dirFd = openSync(targetDir, "r");
+      try {
+        fsyncSync(dirFd);
+      } catch {}
+      closeSync(dirFd);
+    } catch {}
+    try {
+      const finalMode = statSync(targetPath).mode & 0o777;
+      if (finalMode !== intendedMode) {
+        warn(
+          `File mode on ${targetPath} is 0${finalMode.toString(8)} (expected 0${intendedMode.toString(8)})`
+        );
+      }
+    } catch {}
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {}
+  }
 }
 
 const BASE_DIR = join(homedir(), ".opencode-browser");

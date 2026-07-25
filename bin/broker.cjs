@@ -182,6 +182,42 @@ function releaseClaim(tabId) {
   clearDefaultTab(info.sessionId, tabId);
 }
 
+// Extension lifecycle events (#17): self-heal stale tab/group references
+// immediately instead of waiting for the claim TTL.
+function handleExtensionEvent(message) {
+  if (message.event === "tab_removed" && Number.isFinite(message.tabId)) {
+    const tabId = message.tabId;
+    if (claims.has(tabId)) {
+      console.error(`[browser-broker] tab ${tabId} removed; releasing claim`);
+      releaseClaim(tabId);
+    }
+    for (const [sessionId, state] of sessionState.entries()) {
+      let touched = false;
+      if (state.defaultTabId === tabId) {
+        state.defaultTabId = null;
+        touched = true;
+      }
+      if (state.seedTabId === tabId) {
+        state.seedTabId = null;
+        touched = true;
+      }
+      if (touched) {
+        console.error(`[browser-broker] cleared stale tab reference ${tabId} for session ${sessionId}`);
+      }
+    }
+    return;
+  }
+  if (message.event === "tab_group_removed" && Number.isFinite(message.groupId)) {
+    const groupId = message.groupId;
+    for (const [sessionId, state] of sessionState.entries()) {
+      if (state.groupId === groupId) {
+        state.groupId = null;
+        console.error(`[browser-broker] cleared removed group ${groupId} for session ${sessionId}`);
+      }
+    }
+  }
+}
+
 function releaseClaimsForSession(sessionId) {
   for (const [tabId, info] of claims.entries()) {
     if (info.sessionId === sessionId) claims.delete(tabId);
@@ -459,12 +495,14 @@ async function handleTool(pluginSocket, req) {
     }
   }
 
+  let resolvedFromDefault = false;
   if (wantsTab(tool)) {
     if (typeof tabId !== "number") {
       const state = getSessionState(sessionId);
       const defaultTabId = state && Number.isFinite(state.defaultTabId) ? state.defaultTabId : null;
       if (Number.isFinite(defaultTabId)) {
         tabId = defaultTabId;
+        resolvedFromDefault = true;
       } else if (!isCloseTool) {
         tabId = await ensureSessionTab(sessionId);
       } else {
@@ -476,7 +514,39 @@ async function handleTool(pluginSocket, req) {
     if (!claimCheck.ok) throw new Error(claimCheck.error);
   }
 
-  const res = await callExtension(tool, { ...toolArgs, tabId }, sessionId);
+  const groupIdFromSession = isOpenTool && Number.isFinite(toolArgs.groupId);
+
+  let res;
+  try {
+    res = await callExtension(tool, { ...toolArgs, tabId }, sessionId);
+  } catch (err) {
+    const errText = err && err.message ? err.message : String(err);
+    if (/no tab with id/i.test(errText) && typeof tabId === "number") {
+      // Self-heal (#17): the extension reports a tab we still track as gone
+      // (e.g. the user closed it). Drop the stale state immediately.
+      console.error(`[browser-broker] tab ${tabId} is gone; releasing stale state`);
+      releaseClaim(tabId);
+      clearDefaultTab(sessionId, tabId);
+      if (resolvedFromDefault && !isCloseTool) {
+        // Retry once with a fresh background tab.
+        console.error(`[browser-broker] retrying ${tool} with a fresh background tab`);
+        tabId = await ensureSessionTab(sessionId);
+        res = await callExtension(tool, { ...toolArgs, tabId }, sessionId);
+      } else {
+        throw err;
+      }
+    } else if (isOpenTool && groupIdFromSession && /no group with id/i.test(errText)) {
+      // Self-heal (#17): the session tab group was removed; drop it and
+      // retry once ungrouped.
+      const state = getSessionState(sessionId);
+      if (state) state.groupId = null;
+      delete toolArgs.groupId;
+      console.error(`[browser-broker] session group was removed; retrying ${tool} ungrouped`);
+      res = await callExtension(tool, { ...toolArgs, tabId }, sessionId);
+    } else {
+      throw err;
+    }
+  }
 
   const usedTabId =
     res && typeof res.tabId === "number" ? res.tabId : typeof tabId === "number" ? tabId : undefined;
@@ -537,6 +607,10 @@ function handleClientMessage(socket, client, msg) {
         // Forward full result payload so callers can read tabId
         pending.resolve(message.result);
       }
+      return;
+    }
+    if (message && message.type === "event") {
+      handleExtensionEvent(message);
     }
     return;
   }
@@ -659,54 +733,145 @@ function handleClientMessage(socket, client, msg) {
   }
 }
 
-function start() {
-  try {
-    if (fs.existsSync(SOCKET_PATH)) fs.unlinkSync(SOCKET_PATH);
-  } catch {
-    // ignore
-  }
+// --- Startup self-arbitration (#16) ---
+// Multiple spawn sites (plugin, native host) can race to start a broker.
+// Probe the socket before unlinking, and serialize via a pid lockfile.
+const LOCK_PATH = process.platform === "win32" ? null : `${SOCKET_PATH}.lock`;
 
-  const server = net.createServer((socket) => {
-    socket.setNoDelay(true);
-
-    const client = { role: "unknown", sessionId: null };
-    clients.add(client);
-
-    socket.on(
-      "data",
-      createJsonLineParser((msg) => handleClientMessage(socket, client, msg))
-    );
-
-    socket.on("close", () => {
-      clients.delete(client);
-      if (client.role === "native-host" && host && host.socket === socket) {
-        host = null;
-        // fail pending extension requests
-        for (const [extId, pending] of extPending.entries()) {
-          extPending.delete(extId);
-          if (pending.timeout) clearTimeout(pending.timeout);
-          pending.reject(new Error("Native host disconnected"));
+function acquireLock() {
+  if (!LOCK_PATH) return true;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(LOCK_PATH, "wx");
+      try {
+        fs.writeFileSync(fd, `${process.pid}\n`);
+      } catch {}
+      fs.closeSync(fd);
+      return true;
+    } catch (err) {
+      if (!err || err.code !== "EEXIST") throw err;
+      let pid = NaN;
+      try {
+        pid = Number(fs.readFileSync(LOCK_PATH, "utf8").trim());
+      } catch {}
+      if (Number.isFinite(pid) && pid > 0) {
+        try {
+          process.kill(pid, 0); // throws if dead
+          return false; // another live broker holds the lock
+        } catch {
+          // stale lock from a dead process; remove and retry once
         }
       }
-      if (client.sessionId) releaseClaimsForSession(client.sessionId);
+      try {
+        fs.unlinkSync(LOCK_PATH);
+      } catch {}
+    }
+  }
+  return false;
+}
+
+function releaseLock() {
+  if (!LOCK_PATH) return;
+  try {
+    fs.unlinkSync(LOCK_PATH);
+  } catch {}
+}
+
+function start() {
+  const bind = () => {
+    if (!acquireLock()) {
+      console.error("[browser-broker] another live broker holds the lock; exiting");
+      process.exit(0);
+    }
+
+    // The probe and lock proved nothing is listening; a leftover socket file is stale.
+    if (process.platform !== "win32") {
+      try {
+        if (fs.existsSync(SOCKET_PATH)) fs.unlinkSync(SOCKET_PATH);
+      } catch {
+        // ignore
+      }
+    }
+
+    const server = net.createServer((socket) => {
+      socket.setNoDelay(true);
+
+      const client = { role: "unknown", sessionId: null };
+      clients.add(client);
+
+      socket.on(
+        "data",
+        createJsonLineParser((msg) => handleClientMessage(socket, client, msg))
+      );
+
+      socket.on("close", () => {
+        clients.delete(client);
+        if (client.role === "native-host" && host && host.socket === socket) {
+          host = null;
+          // fail pending extension requests
+          for (const [extId, pending] of extPending.entries()) {
+            extPending.delete(extId);
+            if (pending.timeout) clearTimeout(pending.timeout);
+            pending.reject(new Error("Native host disconnected"));
+          }
+        }
+        if (client.sessionId) releaseClaimsForSession(client.sessionId);
+      });
+
+      socket.on("error", () => {
+        // close handler will clean up
+      });
     });
 
-    socket.on("error", () => {
-      // close handler will clean up
+    server.listen(SOCKET_PATH, () => {
+      // Make socket group-readable; ignore errors
+      try {
+        fs.chmodSync(SOCKET_PATH, 0o600);
+      } catch {}
+      console.error(`[browser-broker] listening on ${SOCKET_PATH}`);
     });
-  });
 
-  server.listen(SOCKET_PATH, () => {
-    // Make socket group-readable; ignore errors
+    server.on("error", (err) => {
+      if (err && err.code === "EADDRINUSE") {
+        // Lost the startup race despite the probe; never unlink someone else's active socket.
+        console.error("[browser-broker] socket already in use; exiting");
+        releaseLock();
+        process.exit(0);
+      }
+      console.error("[browser-broker] server error", err);
+      releaseLock();
+      process.exit(1);
+    });
+
+    process.on("exit", releaseLock);
+    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+      process.on(sig, () => {
+        releaseLock();
+        process.exit(0);
+      });
+    }
+  };
+
+  if (process.platform === "win32") {
+    bind();
+    return;
+  }
+
+  // If another broker already owns the socket, defer to it.
+  const probe = net.createConnection(SOCKET_PATH);
+  probe.once("connect", () => {
     try {
-      fs.chmodSync(SOCKET_PATH, 0o600);
+      probe.end();
     } catch {}
-    console.error(`[browser-broker] listening on ${SOCKET_PATH}`);
+    console.error("[browser-broker] another broker already owns the socket; exiting");
+    process.exit(0);
   });
-
-  server.on("error", (err) => {
-    console.error("[browser-broker] server error", err);
-    process.exit(1);
+  probe.once("error", () => {
+    // ECONNREFUSED/ENOENT: stale socket file, safe to take over.
+    try {
+      probe.destroy();
+    } catch {}
+    bind();
   });
 }
 

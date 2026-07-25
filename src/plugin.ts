@@ -2,9 +2,9 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import net from "net";
 import { createAgentBackend, type AgentBackend } from "./agent-backend.js";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "fs";
-import { homedir, userInfo } from "os";
-import { basename, dirname, isAbsolute, join, resolve } from "path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
+import { homedir, tmpdir, userInfo } from "os";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
@@ -78,12 +78,112 @@ function resolveUploadPath(filePath: string): string {
   return isAbsolute(trimmed) ? trimmed : resolve(process.cwd(), trimmed);
 }
 
+const BLOCKED_UPLOAD_BASENAMES = new Set(["id_rsa", "id_ed25519"]);
+const BLOCKED_UPLOAD_EXTENSIONS = new Set([".pem", ".key"]);
+const ENV_FILE_SEGMENT_RE = /^\.env($|\.)/i;
+
+function isPathWithin(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function realpathOrSelf(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+function getBlockedUploadDirs(): string[] {
+  const home = homedir();
+  const raw = [
+    join(home, ".ssh"),
+    join(home, ".aws"),
+    join(home, ".gnupg"),
+    join(home, ".config", "opencode"),
+    join(home, ".opencode-browser"),
+    join(home, "Library", "Keychains"),
+  ];
+  // Check both raw and realpath'd forms (home itself may be symlinked).
+  const dirs = new Set<string>();
+  for (const dir of raw) {
+    dirs.add(dir);
+    dirs.add(realpathOrSelf(dir));
+  }
+  return [...dirs];
+}
+
+function getAllowedUploadRoots(): string[] {
+  const roots: string[] = [process.cwd(), tmpdir()];
+  const extra = process.env.OPENCODE_BROWSER_UPLOAD_DIRS;
+  if (extra) {
+    for (const part of extra.split(":")) {
+      const dir = part.trim();
+      if (dir && isAbsolute(dir)) roots.push(dir);
+    }
+  }
+  const out: string[] = [];
+  for (const root of roots) {
+    const real = realpathOrSelf(root);
+    if (!out.includes(real)) out.push(real);
+  }
+  return out;
+}
+
+function assertUploadAllowed(absPath: string): string {
+  let real: string;
+  try {
+    real = realpathSync(absPath);
+  } catch {
+    throw new Error(`Cannot read file: ${absPath}`);
+  }
+
+  // Hard blocklist — always refused, even inside allowed roots.
+  for (const blockedDir of getBlockedUploadDirs()) {
+    if (isPathWithin(real, blockedDir)) {
+      throw new Error(
+        `Refusing to read sensitive path: ${real}. This location is always blocked ` +
+          `(credential/config directories such as ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/opencode, ` +
+          `~/.opencode-browser, ~/Library/Keychains) regardless of upload boundary settings.`
+      );
+    }
+  }
+  const segments = real.split(sep);
+  for (const segment of segments) {
+    if (ENV_FILE_SEGMENT_RE.test(segment)) {
+      throw new Error(
+        `Refusing to read sensitive file: ${real}. Paths containing .env files are always blocked.`
+      );
+    }
+  }
+  const base = basename(real).toLowerCase();
+  if (BLOCKED_UPLOAD_BASENAMES.has(base) || BLOCKED_UPLOAD_EXTENSIONS.has(extname(base))) {
+    throw new Error(
+      `Refusing to read sensitive file: ${real}. Private keys and certificate files ` +
+        `(id_rsa, id_ed25519, *.pem, *.key) are always blocked.`
+    );
+  }
+
+  // Boundary check AFTER realpath so symlink escapes fail closed.
+  const roots = getAllowedUploadRoots();
+  if (!roots.some((root) => isPathWithin(real, root))) {
+    throw new Error(
+      `Refusing to read file outside the allowed upload boundary: ${real}. ` +
+        `Allowed roots: the workspace (${realpathOrSelf(process.cwd())}) and the OS temp dir (${realpathOrSelf(tmpdir())}). ` +
+        `To allow this file, move it into the workspace or set OPENCODE_BROWSER_UPLOAD_DIRS ` +
+        `(colon-separated absolute directories).`
+    );
+  }
+  return real;
+}
+
 function buildFileUploadPayload(
   filePath: string,
   fileName?: string,
   mimeType?: string
 ): { name: string; mimeType?: string; base64: string } {
-  const absPath = resolveUploadPath(filePath);
+  const absPath = assertUploadAllowed(resolveUploadPath(filePath));
   const stats = statSync(absPath);
   if (!stats.isFile()) throw new Error(`Not a file: ${absPath}`);
   if (stats.size > MAX_UPLOAD_BYTES) {
@@ -246,6 +346,43 @@ function toolResultText(data: any, fallback: string): string {
   if (typeof data === "string") return data;
   if (data?.content != null) return JSON.stringify(data.content);
   return fallback;
+}
+
+function screenshotResultText(data: any, fallback: string): string {
+  // The extension may embed a structured envelope
+  // ({ ok, method, degraded, note, data }) inside content for screenshots.
+  // Surface the metadata so degraded captures are not silently indistinguishable.
+  const content = data?.content;
+  if (typeof content === "string") {
+    const trimmed = content.trimStart();
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object") {
+          const meta: string[] = [];
+          if (parsed.method != null) meta.push(`method: ${parsed.method}`);
+          if (parsed.degraded != null) meta.push(`degraded: ${parsed.degraded}`);
+          if (parsed.note != null) meta.push(`note: ${parsed.note}`);
+          const image =
+            typeof parsed.data === "string"
+              ? parsed.data
+              : typeof parsed.content === "string"
+                ? parsed.content
+                : null;
+          if (meta.length > 0) {
+            return image ? `${image}\n[${meta.join(", ")}]` : `[${meta.join(", ")}]`;
+          }
+        }
+      } catch {
+        // not a JSON envelope — fall through
+      }
+    }
+    // Plain image data (data URL / base64) — return exactly as-is.
+    return content;
+  }
+  const text = toolResultText(data, fallback);
+  if (typeof data?.note === "string" && data.note) return `${text}\n[note: ${data.note}]`;
+  return text;
 }
 
 async function toolRequest(toolName: string, args: Record<string, any>): Promise<any> {
@@ -914,7 +1051,7 @@ const plugin: Plugin = async (ctx) => {
         },
         async execute({ tabId, fullPage, clip }, ctx) {
           const data = await toolRequest("screenshot", { tabId, fullPage, clip });
-          return toolResultText(data, "Screenshot failed");
+          return screenshotResultText(data, "Screenshot failed");
         },
       }),
 
@@ -1322,8 +1459,15 @@ const plugin: Plugin = async (ctx) => {
 
       browser_set_file_input: tool({
         description:
+          "HIGH SENSITIVITY: reads a local file and uploads it into a web page. " +
           "Set a file input's selected file via local path. selector supports locators (uid:/…); " +
-          "omit index for strict unique match.",
+          "omit index for strict unique match. " +
+          "File reads are restricted: by default only files under the current workspace " +
+          "(process.cwd()) and the OS temp dir are allowed; extra roots can be added via the " +
+          "OPENCODE_BROWSER_UPLOAD_DIRS env var (colon-separated absolute dirs). Credential " +
+          "locations (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/opencode, ~/.opencode-browser, " +
+          "~/Library/Keychains), .env files, and key files (id_rsa, id_ed25519, *.pem, *.key) " +
+          "are always refused. Only upload files the user explicitly asked to upload.",
         args: {
           selector: schema.string(),
           filePath: schema.string(),
@@ -1336,7 +1480,16 @@ const plugin: Plugin = async (ctx) => {
         },
         async execute({ selector, filePath, fileName, mimeType, index, tabId, timeoutMs, pollMs }, ctx) {
           if (USE_AGENT_BACKEND) {
-            const data = await toolRequest("set_file_input", { selector, filePath, tabId, index, timeoutMs, pollMs });
+            // Enforce the same upload boundary before handing the path to the agent backend.
+            const allowedPath = assertUploadAllowed(resolveUploadPath(filePath));
+            const data = await toolRequest("set_file_input", {
+              selector,
+              filePath: allowedPath,
+              tabId,
+              index,
+              timeoutMs,
+              pollMs,
+            });
             return toolResultText(data, "Set file input");
           }
 

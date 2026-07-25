@@ -22,6 +22,7 @@
     "build": "bun build src/plugin.ts --target=node --outfile=dist/plugin.js",
     "build:cws": "node build-cws-package.mjs",
     "check:extension": "node --check extension/background.js",
+    "check:identity": "! grep -rn \"@different-ai/opencode-browser\" . --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=dist --exclude=bun.lock --exclude=package-lock.json | grep -viE \"fork|upstream|originally\"",
     "prepublishOnly": "bun run build",
     "publish": "node -e \"if (process.env.npm_command === 'publish') process.exit(0); require('child_process').execSync('npm publish --access public', { stdio: 'inherit' });\"",
     "setup": "node bin/cli.js install",

@@ -52,6 +52,8 @@ bun run setup      # 或 node bin/cli.js install
 
 ### 配置 OpenCode
 
+> 注：本仓库不再随附 `opencode.json`（已加入 `.gitignore`，避免泄露维护者本机路径）。本地开发请复制 `opencode.example.json` 为 `opencode.json` 并按需调整：npm 发布安装用包名 `@ageless-h/opencode-browser`；本地 clone 用 `file:///absolute/path/to/clone`。安装器第 7 步会自动写入该配置。
+
 本地 clone 安装时，插件项指向本仓库的绝对路径 `file://` URL（安装器会自动写入）：
 
 ```json
@@ -101,6 +103,10 @@ npx . self-test                # 端到端冒烟
 ```bash
 bun run build:cws
 ```
+
+### 开发检查
+
+- `bun run check:identity`：扫描仓库中遗留的上游（upstream）`@different-ai/opencode-browser` 引用（排除署名/溯源说明行），有命中即非零退出。
 
 产物与提交清单见：
 

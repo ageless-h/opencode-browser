@@ -27,10 +27,10 @@ metadata:
 
 ## CLI-first debugging
 
-- List all available tools: `npx @different-ai/opencode-browser tools`
-- Run one tool directly: `npx @different-ai/opencode-browser tool browser_status`
-- Pass JSON args: `npx @different-ai/opencode-browser tool browser_query --args '{"mode":"page_text"}'`
-- Run smoke test: `npx @different-ai/opencode-browser self-test`
+- List all available tools: `npx @ageless-h/opencode-browser tools`
+- Run one tool directly: `npx @ageless-h/opencode-browser tool browser_status`
+- Pass JSON args: `npx @ageless-h/opencode-browser tool browser_query --args '{"mode":"page_text"}'`
+- Run smoke test: `npx @ageless-h/opencode-browser self-test`
 - After `update`, reload the unpacked extension in `chrome://extensions`
 
 This path is useful for reproducing selector/scroll issues quickly before running a full OpenCode session.
