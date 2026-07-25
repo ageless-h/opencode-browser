@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@different-ai/opencode-browser@latest"
+    "file:///Users/huzhiheng/code/opencode/opencode-browser"
   ]
 }

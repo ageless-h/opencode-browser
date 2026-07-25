@@ -294,7 +294,7 @@ async function connect() {
       if (err?.message) {
         connectionAttempts++
         if (connectionAttempts === 1) {
-          console.log("[OpenCode] Native host not available. Run: npx @different-ai/opencode-browser install")
+          console.log("[OpenCode] Native host not available. Run: npx @ageless-h/opencode-browser install")
         } else if (connectionAttempts % 20 === 0) {
           console.log("[OpenCode] Still waiting for native host...")
         }
@@ -469,16 +469,32 @@ async function pageOps(command, args) {
     return typeof value === "string" ? value : ""
   }
 
+  const SENSITIVE_NAME_RE = /passw|pwd|token|secret|api[-_]?key|otp|csrf|session/i
+
+  function isSensitiveField(el) {
+    if (!el || !el.tagName) return false
+    const type = String(el.getAttribute?.("type") || "").toLowerCase()
+    if (type === "password" || type === "hidden") return true
+    const autocomplete = String(el.getAttribute?.("autocomplete") || "").toLowerCase()
+    if (["current-password", "new-password", "one-time-code"].includes(autocomplete)) return true
+    const nameId = `${el.getAttribute?.("name") || ""} ${el.id || ""}`
+    return SENSITIVE_NAME_RE.test(nameId)
+  }
+
+  function serializeFormValue(el) {
+    if (isSensitiveField(el)) return "[REDACTED]"
+    return el.value
+  }
+
   function normalizeSelectorList(selector) {
     if (Array.isArray(selector)) {
       return selector.map((s) => safeString(s).trim()).filter(Boolean)
     }
+    // A string is always exactly one selector/locator — never split on commas.
+    // CSS comma lists ("button, a") still work natively via querySelectorAll.
     if (typeof selector !== "string") return []
-    const parts = selector
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)
-    return parts.length ? parts : [selector.trim()].filter(Boolean)
+    const trimmed = selector.trim()
+    return trimmed ? [trimmed] : []
   }
 
   function stripQuotes(value) {
@@ -892,10 +908,6 @@ async function pageOps(command, args) {
       el.dispatchEvent(new MouseEvent("mouseup", opts))
       el.dispatchEvent(new MouseEvent("click", opts))
     } catch {}
-
-    try {
-      el.click()
-    } catch {}
   }
 
   function setNativeValue(el, value) {
@@ -922,7 +934,7 @@ async function pageOps(command, args) {
     nodes.forEach((el) => {
       try {
         const name = el.getAttribute("aria-label") || el.getAttribute("name") || el.id || el.className || el.tagName
-        const value = el.value
+        const value = serializeFormValue(el)
         if (value != null && String(value).trim()) out.push(`${name}: ${value}`)
       } catch {}
     })
@@ -1187,6 +1199,24 @@ async function pageOps(command, args) {
     match.chosen.dispatchEvent(new Event("change", { bubbles: true }))
 
     return { ok: true, selectorUsed: match.selectorUsed, count: dt.files.length, names }
+  }
+
+  if (command === "focus") {
+    // Resolve + focus only (used by the trusted CDP keyboard path).
+    if (!selectors.length) return { ok: false, error: "Selector is required" }
+    const match = await resolveActionMatch(selectors, index, timeoutMs, pollMs)
+    if (match.ambiguous) return strictMatchError(match.selectorUsed, match.matches)
+    if (!match.chosen) {
+      return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    }
+    try {
+      match.chosen.focus()
+    } catch {}
+    return {
+      ok: true,
+      selectorUsed: match.selectorUsed,
+      uid: match.chosen.getAttribute?.("data-opc-uid") || null,
+    }
   }
 
   if (command === "key") {
@@ -1530,7 +1560,7 @@ async function pageOps(command, args) {
         role: getImplicitRole(el),
         name: getAccessibleName(el).slice(0, 120),
         text: (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 100),
-        value: "value" in el ? String(el.value ?? "") : null,
+        value: "value" in el ? String(serializeFormValue(el) ?? "") : null,
         boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       })
       if (nodes.length >= limit) break
@@ -2050,7 +2080,15 @@ async function pageOps(command, args) {
         if (el.tagName === "SELECT") {
           visibleText = el.selectedOptions?.[0]?.text || el.value || null
         } else if ("value" in el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
-          visibleText = String(el.value || "").slice(0, 200) || null
+          const elType = (el.getAttribute?.("type") || "").toLowerCase()
+          const elAc = (el.getAttribute?.("autocomplete") || "").toLowerCase()
+          const elNameId = `${el.name || ""} ${el.id || ""}`
+          const elSensitive =
+            elType === "password" ||
+            elType === "hidden" ||
+            ["current-password", "new-password", "one-time-code"].includes(elAc) ||
+            /passw|pwd|token|secret|api[-_]?key|otp|csrf|session/i.test(elNameId)
+          visibleText = elSensitive ? "[REDACTED]" : String(el.value || "").slice(0, 200) || null
         } else {
           visibleText = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 200) || null
         }
@@ -2431,6 +2469,29 @@ async function toolKey({
 } = {}) {
   if (typeof key !== "string" || !key) throw new Error("key is required")
   const tab = await getTabById(tabId)
+
+  // Trusted CDP keyboard path: enables native default actions (Tab traversal,
+  // Enter submit, arrow navigation) that synthetic KeyboardEvent cannot trigger.
+  const cdp = await cdpInputSession(tab.id)
+  if (cdp) {
+    if (selector) {
+      const focused = await runInPage(tab.id, "focus", { selector, index, timeoutMs, pollMs })
+      if (!focused?.ok) throw new Error(formatActionError(focused, "Focus failed"))
+    }
+    const modifierKeys = []
+    if (altKey) modifierKeys.push("Alt")
+    if (ctrlKey) modifierKeys.push("Control")
+    if (metaKey) modifierKeys.push("Meta")
+    if (shiftKey) modifierKeys.push("Shift")
+    const modifiers = cdpModifierMask(modifierKeys)
+    const info = cdpKeyInfo(key, { code, keyCode })
+    await cdpKeyPress(tab.id, info, { modifiers, autoRepeat: !!repeat, delayMs: Number.isFinite(delayMs) ? delayMs : 0 })
+    return {
+      tabId: tab.id,
+      content: JSON.stringify({ ok: true, key, code: info.code, method: "cdp" }),
+    }
+  }
+
   const args = {
     key,
     code,
@@ -2455,6 +2516,7 @@ async function toolKey({
       key: result.key,
       code: result.code,
       target: result.target,
+      method: "synthetic",
     }),
   }
 }
@@ -2956,10 +3018,22 @@ async function toolScreenshot({ tabId, fullPage = false, clip } = {}) {
     Number.isFinite(clip.width) &&
     Number.isFinite(clip.height)
 
+  // chrome.tabs.captureVisibleTab always captures the window's ACTIVE tab.
+  // A background target tab must go through CDP Page.captureScreenshot.
+  const isActiveTab = tab.active === true
+  const needCdp = wantFull || hasClip || !isActiveTab
+
   // Codex ScreenshotOptions: fullPage / clip — prefer CDP when needed
-  if (wantFull || hasClip) {
+  if (needCdp) {
     const state = await ensureDebuggerAttached(tab.id)
     if (!state?.attached) {
+      if (!isActiveTab) {
+        throw new Error(
+          state?.unavailableReason
+            ? `cannot screenshot background tab without debugger: ${state.unavailableReason}`
+            : "cannot screenshot background tab without debugger"
+        )
+      }
       if (wantFull) {
         throw new Error(
           state?.unavailableReason
@@ -2992,8 +3066,12 @@ async function toolScreenshot({ tabId, fullPage = false, clip } = {}) {
     try {
       remote = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.captureScreenshot", params)
     } catch (e) {
+      if (!isActiveTab) {
+        // Never fall back to captureVisibleTab for a background tab — it would
+        // silently capture the wrong (active) tab.
+        throw new Error(`cannot screenshot background tab without debugger: CDP capture failed (${e?.message || e})`)
+      }
       // fallback: viewport capture if CDP path fails
-      if (!wantFull && !hasClip) throw e
       try {
         const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
         return {
@@ -3010,6 +3088,7 @@ async function toolScreenshot({ tabId, fullPage = false, clip } = {}) {
     return { tabId: tab.id, content: `data:image/png;base64,${b64}` }
   }
 
+  // Plain viewport capture — only when the target tab IS the active tab.
   const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
   return { tabId: tab.id, content: png }
 }
@@ -3377,6 +3456,26 @@ async function toolPress({ selector, key, keys, tabId, index, timeoutMs, pollMs 
   const k = key || (Array.isArray(keys) && keys.length ? keys[0] : null)
   if (!k) throw new Error("key is required (Codex locator.press)")
   const tab = await getTabById(tabId)
+
+  // Trusted CDP keyboard path (see toolKey).
+  const cdp = await cdpInputSession(tab.id)
+  if (cdp) {
+    const focused = await runInPage(tab.id, "focus", { selector, index, timeoutMs, pollMs })
+    if (!focused?.ok) throw new Error(formatActionError(focused, "press failed"))
+    const info = cdpKeyInfo(k)
+    await cdpKeyPress(tab.id, info, {})
+    return {
+      tabId: tab.id,
+      content: JSON.stringify({
+        ok: true,
+        selectorUsed: focused.selectorUsed,
+        key: k,
+        uid: focused.uid ?? null,
+        method: "cdp",
+      }),
+    }
+  }
+
   const result = await runInPage(tab.id, "press", {
     selector,
     key: k,
@@ -3385,7 +3484,7 @@ async function toolPress({ selector, key, keys, tabId, index, timeoutMs, pollMs 
     pollMs,
   })
   if (!result?.ok) throw new Error(formatActionError(result, "press failed"))
-  return { tabId: tab.id, content: JSON.stringify(result) }
+  return { tabId: tab.id, content: JSON.stringify({ ...result, method: "synthetic" }) }
 }
 
 // --- Trusted input via CDP (Codex browser-client parity: Input.dispatchMouseEvent) ---
@@ -3427,6 +3526,84 @@ async function cdpDispatchMouse(tabId, type, { x, y, button = "none", clickCount
     clickCount,
     modifiers,
   })
+}
+
+// --- Trusted keyboard via CDP (Input.dispatchKeyEvent) ---
+// Synthetic KeyboardEvent dispatch fires listeners but skips native default
+// actions (Tab traversal, Enter submit, arrow navigation); the CDP path does not.
+
+const CDP_KEY_MAP = {
+  Enter: { code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+  Tab: { code: "Tab", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9 },
+  Escape: { code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 },
+  Backspace: { code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 },
+  Delete: { code: "Delete", windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 },
+  ArrowLeft: { code: "ArrowLeft", windowsVirtualKeyCode: 37, nativeVirtualKeyCode: 37 },
+  ArrowUp: { code: "ArrowUp", windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38 },
+  ArrowRight: { code: "ArrowRight", windowsVirtualKeyCode: 39, nativeVirtualKeyCode: 39 },
+  ArrowDown: { code: "ArrowDown", windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40 },
+  Home: { code: "Home", windowsVirtualKeyCode: 36, nativeVirtualKeyCode: 36 },
+  End: { code: "End", windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35 },
+  PageUp: { code: "PageUp", windowsVirtualKeyCode: 33, nativeVirtualKeyCode: 33 },
+  PageDown: { code: "PageDown", windowsVirtualKeyCode: 34, nativeVirtualKeyCode: 34 },
+  " ": { code: "Space", windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32 },
+}
+
+function cdpKeyInfo(key, { code, keyCode } = {}) {
+  let info
+  if (Object.prototype.hasOwnProperty.call(CDP_KEY_MAP, key)) {
+    info = { key, ...CDP_KEY_MAP[key] }
+  } else if (typeof key === "string" && key.length === 1) {
+    const upper = key.toUpperCase()
+    const isLetter = /^[A-Z]$/.test(upper)
+    const isDigit = /^[0-9]$/.test(upper)
+    info = {
+      key,
+      code: isLetter ? `Key${upper}` : isDigit ? `Digit${upper}` : key,
+      windowsVirtualKeyCode: (isLetter || isDigit ? upper : key).charCodeAt(0),
+      nativeVirtualKeyCode: (isLetter || isDigit ? upper : key).charCodeAt(0),
+    }
+  } else {
+    // Unknown named key: best effort.
+    info = { key, code: key, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 }
+  }
+  if (typeof code === "string" && code) info.code = code
+  if (Number.isFinite(keyCode)) {
+    info.windowsVirtualKeyCode = keyCode
+    info.nativeVirtualKeyCode = keyCode
+  }
+  return info
+}
+
+async function cdpDispatchKey(
+  tabId,
+  { type, key, code, windowsVirtualKeyCode, nativeVirtualKeyCode, modifiers = 0, text, unmodifiedText, autoRepeat = false } = {}
+) {
+  const params = { type, key, code, windowsVirtualKeyCode, nativeVirtualKeyCode, modifiers, autoRepeat }
+  if (text !== undefined) params.text = text
+  if (unmodifiedText !== undefined) params.unmodifiedText = unmodifiedText
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", params)
+}
+
+/** Full trusted key press: rawKeyDown (+ char for text-producing keys), then keyUp. */
+async function cdpKeyPress(tabId, info, { modifiers = 0, autoRepeat = false, delayMs = 0 } = {}) {
+  const printable = typeof info.key === "string" && info.key.length === 1
+  // Enter must emit a char ("\r") — implicit form submission / keypress default
+  // actions trigger on the char event, not on rawKeyDown.
+  const charText = printable ? info.key : info.key === "Enter" ? "\r" : null
+  await cdpDispatchKey(tabId, { type: "rawKeyDown", ...info, modifiers, autoRepeat })
+  if (charText !== null) {
+    await cdpDispatchKey(tabId, {
+      type: "char",
+      ...info,
+      modifiers,
+      text: charText,
+      unmodifiedText: charText,
+      autoRepeat,
+    })
+  }
+  if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
+  await cdpDispatchKey(tabId, { type: "keyUp", ...info, modifiers })
 }
 
 async function toolMouseMove({ x, y, tabId } = {}) {
@@ -3554,6 +3731,23 @@ async function toolSnapshot({ tabId }) {
     func: () => {
       function safeText(s) {
         return typeof s === "string" ? s : ""
+      }
+
+      const SENSITIVE_NAME_RE = /passw|pwd|token|secret|api[-_]?key|otp|csrf|session/i
+
+      function isSensitiveField(el) {
+        if (!el || !el.tagName) return false
+        const type = String(el.getAttribute?.("type") || "").toLowerCase()
+        if (type === "password" || type === "hidden") return true
+        const autocomplete = String(el.getAttribute?.("autocomplete") || "").toLowerCase()
+        if (["current-password", "new-password", "one-time-code"].includes(autocomplete)) return true
+        const nameId = `${el.getAttribute?.("name") || ""} ${el.id || ""}`
+        return SENSITIVE_NAME_RE.test(nameId)
+      }
+
+      function serializeFormValue(el) {
+        if (isSensitiveField(el)) return "[REDACTED]"
+        return el.value
       }
 
       function isVisible(el) {
@@ -3701,8 +3895,7 @@ async function toolSnapshot({ tabId }) {
 
           if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT") {
             if (el.type) node.type = el.type
-            if (el.value != null && el.tagName !== "SELECT") node.value = el.value
-            if (el.tagName === "SELECT") node.value = el.value
+            if (el.value != null) node.value = serializeFormValue(el)
             if (el.readOnly) node.readOnly = true
             if (el.disabled) node.disabled = true
             if (el.checked != null && (el.type === "checkbox" || el.type === "radio")) node.checked = !!el.checked

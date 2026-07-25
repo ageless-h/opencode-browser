@@ -60,7 +60,7 @@ the `uid:` of the exact node. Selector tools wait up to 2000ms by default (`time
 ## Sensitive surfaces
 
 - `browser_history` reads the user's browsing history — only when the task genuinely needs it, with tight `queries`/`from`/`to` bounds.
-- `browser_evaluate` is read-only; do not use it to mutate page state (use fill/click/select tools).
+- `browser_evaluate` runs arbitrary JavaScript in the page's main world with full side effects (DOM mutation, storage, network requests, clicks, form submission) — it is NOT a safe observation step. Use it only when no dedicated tool can do the job; for observation use `browser_query`/`browser_snapshot`, for actions use fill/click/select tools.
 - Clipboard tools work without page focus (offscreen), but avoid overwriting the user's clipboard unless the task requires it.
 
 Full tool list: `README.md` in the opencode-browser repo.

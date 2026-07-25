@@ -24,7 +24,7 @@
     "check:extension": "node --check extension/background.js",
     "prepublishOnly": "bun run build",
     "publish": "node -e \"if (process.env.npm_command === 'publish') process.exit(0); require('child_process').execSync('npm publish --access public', { stdio: 'inherit' });\"",
-    "install": "node bin/cli.js install",
+    "setup": "node bin/cli.js install",
     "uninstall": "node bin/cli.js uninstall",
     "status": "node bin/cli.js status",
     "tools": "node bin/cli.js tools",
@@ -53,7 +53,8 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "agent-browser": "^0.4.0"
+    "agent-browser": "^0.4.0",
+    "jsonc-parser": "^3.3.1"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "*",

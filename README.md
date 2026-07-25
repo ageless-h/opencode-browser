@@ -33,8 +33,12 @@ OpenCode Plugin <-> Local Broker (unix socket) <-> Native Host <-> Chrome Extens
 ```bash
 git clone https://github.com/ageless-h/opencode-browser.git
 cd opencode-browser
-bun install
-node bin/cli.js install
+
+# 第 1 步：安装依赖（纯下载，非交互，不会改动系统）
+bun install        # 或 npm install
+
+# 第 2 步：运行系统安装器（交互式：复制扩展、注册 native host、写配置）
+bun run setup      # 或 node bin/cli.js install
 ```
 
 支持 macOS、Linux、Windows（Chrome / Edge / Brave / Chromium）。
@@ -48,10 +52,21 @@ node bin/cli.js install
 
 ### 配置 OpenCode
 
+本地 clone 安装时，插件项指向本仓库的绝对路径 `file://` URL（安装器会自动写入）：
+
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": ["file:///path/to/opencode-browser"]
+}
+```
+
+如果是作为 npm 包安装（位于 `node_modules` 内），则使用包名：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@ageless-h/opencode-browser"]
 }
 ```
 

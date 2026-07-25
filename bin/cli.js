@@ -20,18 +20,50 @@ import {
   readdirSync,
   unlinkSync,
   chmodSync,
+  renameSync,
 } from "fs";
 import { homedir, platform, userInfo } from "os";
-import { join, dirname } from "path";
+import { join, dirname, basename } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { createInterface } from "readline";
 import { createConnection } from "net";
 import { execSync, spawn, spawnSync } from "child_process";
 import { createHash } from "crypto";
+import {
+  parse as parseJsonc,
+  modify as modifyJsonc,
+  applyEdits as applyJsoncEdits,
+} from "jsonc-parser";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PACKAGE_ROOT = join(__dirname, "..");
+
+const PACKAGE_MANIFEST = JSON.parse(
+  readFileSync(join(PACKAGE_ROOT, "package.json"), "utf-8")
+);
+const PACKAGE_NAME = PACKAGE_MANIFEST.name;
+const PACKAGE_VERSION = PACKAGE_MANIFEST.version;
+
+// Plugin entry written into the user's opencode.json/opencode.jsonc:
+// local clone -> absolute file:// URL of the package root; installed npm
+// package (inside node_modules) -> the package name.
+function getPluginConfigValue() {
+  const isLocalCheckout =
+    existsSync(join(PACKAGE_ROOT, "src")) &&
+    existsSync(join(PACKAGE_ROOT, "extension")) &&
+    !PACKAGE_ROOT.split(/[\\/]/).includes("node_modules");
+  return isLocalCheckout ? pathToFileURL(PACKAGE_ROOT).href : PACKAGE_NAME;
+}
+
+function writeFileAtomic(filePath, contents) {
+  const tmpPath = join(
+    dirname(filePath),
+    `.${basename(filePath)}.tmp-${process.pid}-${Date.now()}`
+  );
+  writeFileSync(tmpPath, contents);
+  renameSync(tmpPath, filePath);
+}
 
 const BASE_DIR = join(homedir(), ".opencode-browser");
 const EXTENSION_DIR = join(BASE_DIR, "extension");
@@ -421,7 +453,7 @@ function reportWindowsNativeHostStatus() {
     }
   }
   if (!foundAny) {
-    warn("No native host registry entries found. Run: npx @different-ai/opencode-browser install");
+    warn(`No native host registry entries found. Run: npx ${PACKAGE_NAME} install`);
   }
 }
 
@@ -518,7 +550,7 @@ async function listTools() {
 async function runToolCommand() {
   const toolName = process.argv[3];
   if (!toolName) {
-    throw new Error("Usage: npx @different-ai/opencode-browser tool <toolName> [argsJson]");
+    throw new Error(`Usage: npx ${PACKAGE_NAME} tool <toolName> [argsJson]`);
   }
 
   const args = parseJsonArg(getToolArgJson(), {});
@@ -551,7 +583,7 @@ async function selfTest() {
   const status = parseMaybeJson(statusRaw);
   if (!status || status.broker !== true || status.hostConnected !== true) {
     throw new Error(
-      "browser_status indicates the extension is not connected. Run `npx @different-ai/opencode-browser install` and click the extension icon in Chrome."
+      `browser_status indicates the extension is not connected. Run \`npx ${PACKAGE_NAME} install\` and click the extension icon in Chrome.`
     );
   }
 
@@ -641,29 +673,29 @@ ${color("cyan", "Browser automation plugin (native messaging + per-tab ownership
   } else {
     log(`
 ${color("bright", "Usage:")}
-  npx @different-ai/opencode-browser install
-  npx @different-ai/opencode-browser update
-  npx @different-ai/opencode-browser status
-  npx @different-ai/opencode-browser uninstall
-  npx @different-ai/opencode-browser tools
-  npx @different-ai/opencode-browser tool <toolName> [argsJson]
-  npx @different-ai/opencode-browser self-test
-  npx @different-ai/opencode-browser agent-install
-  npx @different-ai/opencode-browser agent-gateway
+  npx ${PACKAGE_NAME} install
+  npx ${PACKAGE_NAME} update
+  npx ${PACKAGE_NAME} status
+  npx ${PACKAGE_NAME} uninstall
+  npx ${PACKAGE_NAME} tools
+  npx ${PACKAGE_NAME} tool <toolName> [argsJson]
+  npx ${PACKAGE_NAME} self-test
+  npx ${PACKAGE_NAME} agent-install
+  npx ${PACKAGE_NAME} agent-gateway
 
 ${color("bright", "Options:")}
   --extension-id <id> (or OPENCODE_BROWSER_EXTENSION_ID)
   --args '{"selector":"text:Inbox"}' (for tool command)
 
 ${color("bright", "Quick Start:")}
-  1. Run: npx @different-ai/opencode-browser install
+  1. Run: npx ${PACKAGE_NAME} install
   2. Restart OpenCode
   3. Use: browser_navigate / browser_click / browser_snapshot
 
 ${color("bright", "Agent Mode:")}
-  1. Run: npx @different-ai/opencode-browser agent-install
+  1. Run: npx ${PACKAGE_NAME} agent-install
   2. Set OPENCODE_BROWSER_BACKEND=agent
-  3. Optionally run: npx @different-ai/opencode-browser agent-gateway
+  3. Optionally run: npx ${PACKAGE_NAME} agent-gateway
 `);
   }
 
@@ -787,23 +819,7 @@ Find it at ${color("cyan", "chrome://extensions")}:
 
   header("Step 7: Configure OpenCode");
 
-  const desiredPlugin = "@different-ai/opencode-browser";
-
-  function normalizePlugins(val) {
-    if (Array.isArray(val)) return val.filter((v) => typeof v === "string");
-    if (typeof val === "string" && val.trim()) return [val.trim()];
-    return [];
-  }
-
-  function stripJsoncComments(contents) {
-    return contents
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/^\s*\/\/.*$/gm, "");
-  }
-
-  function sanitizeJson(contents) {
-    return stripJsoncComments(contents).replace(/,\s*(\]|\})/g, "$1");
-  }
+  const desiredPlugin = getPluginConfigValue();
 
   function findOpenCodeConfigPath(configDir) {
     const jsoncPath = join(configDir, "opencode.jsonc");
@@ -862,37 +878,64 @@ Find it at ${color("cyan", "chrome://extensions")}:
 
     if (shouldUpdate) {
       try {
-        let config = { $schema: "https://opencode.ai/config.json", plugin: [] };
-        let canWriteConfig = true;
-
-        if (hasExistingConfig) {
+        if (!hasExistingConfig) {
+          ensureDir(configDir);
+          const fresh = {
+            $schema: "https://opencode.ai/config.json",
+            plugin: [desiredPlugin],
+          };
+          writeFileAtomic(configPath, JSON.stringify(fresh, null, 2) + "\n");
+          success(`Created ${configPath} with plugin`);
+        } else {
           const rawConfig = readFileSync(configPath, "utf-8");
-          try {
-            config = JSON.parse(sanitizeJson(rawConfig));
-          } catch (e) {
-            error(`Failed to parse ${configPath}: ${e.message}`);
-            const shouldOverwrite = await confirm("Config is invalid JSON. Back up and recreate it?");
-            if (shouldOverwrite) {
-              const backupPath = `${configPath}.bak-${Date.now()}`;
-              writeFileSync(backupPath, rawConfig);
-              warn(`Backed up invalid config to ${backupPath}`);
-              config = { $schema: "https://opencode.ai/config.json", plugin: [] };
+          const parseErrors = [];
+          const parsed = parseJsonc(rawConfig, parseErrors, {
+            allowTrailingComma: true,
+            allowEmptyContent: true,
+          });
+
+          if (parseErrors.length > 0) {
+            error(`Failed to parse ${configPath} (${parseErrors.length} error(s)). Leaving it untouched.`);
+            warn("Fix the JSONC manually and rerun install; the config will NOT be modified automatically.");
+          } else if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            warn(`${configPath} is not a JSON object. Leaving it untouched.`);
+          } else {
+            const pluginVal = parsed.plugin;
+            const plugins = Array.isArray(pluginVal)
+              ? pluginVal.filter((v) => typeof v === "string")
+              : typeof pluginVal === "string" && pluginVal.trim()
+                ? [pluginVal.trim()]
+                : [];
+
+            if (plugins.includes(desiredPlugin)) {
+              success(`${configPath} already includes the plugin; leaving it untouched.`);
             } else {
-              canWriteConfig = false;
+              const formattingOptions = {
+                insertSpaces: true,
+                tabSize: 2,
+                eol: rawConfig.includes("\r\n") ? "\r\n" : "\n",
+              };
+
+              // Preserve comments/formatting via targeted edits.
+              const pluginEdits = Array.isArray(pluginVal)
+                ? modifyJsonc(rawConfig, ["plugin", -1], desiredPlugin, { formattingOptions })
+                : modifyJsonc(rawConfig, ["plugin"], [...plugins, desiredPlugin], { formattingOptions });
+              let updated = applyJsoncEdits(rawConfig, pluginEdits);
+
+              if (typeof parsed.$schema !== "string") {
+                const schemaEdits = modifyJsonc(
+                  updated,
+                  ["$schema"],
+                  "https://opencode.ai/config.json",
+                  { formattingOptions }
+                );
+                updated = applyJsoncEdits(updated, schemaEdits);
+              }
+
+              writeFileAtomic(configPath, updated);
+              success(`Updated ${configPath} with plugin (comments/formatting preserved)`);
             }
           }
-        }
-
-        if (canWriteConfig) {
-          config.plugin = normalizePlugins(config.plugin);
-          if (!config.plugin.includes(desiredPlugin)) config.plugin.push(desiredPlugin);
-          if (typeof config.$schema !== "string") config.$schema = "https://opencode.ai/config.json";
-
-          ensureDir(configDir);
-          writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
-          success(`Updated ${configPath} with plugin`);
-        } else {
-          warn(`Skipped updating ${configPath}. Fix JSON manually and rerun install.`);
         }
       } catch (e) {
         error(`Failed to update ${configPath}: ${e.message}`);
@@ -1119,7 +1162,7 @@ async function status() {
       }
     }
     if (!foundAny) {
-      warn("No native host manifest found. Run: npx @different-ai/opencode-browser install");
+      warn(`No native host manifest found. Run: npx ${PACKAGE_NAME} install`);
     }
   }
 
@@ -1200,7 +1243,7 @@ async function uninstall() {
 ${color("bright", "Note:")}
 - The unpacked extension folder remains at: ${EXTENSION_DIR}
 - Remove it manually in ${color("cyan", "chrome://extensions")}
-- Remove ${color("bright", "@different-ai/opencode-browser")} from your opencode.json/opencode.jsonc plugin list if desired.
+- Remove ${color("bright", PACKAGE_NAME)} from your opencode.json/opencode.jsonc plugin list if desired.
 `);
 }
 

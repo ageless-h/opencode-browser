@@ -187,7 +187,7 @@ async function ensureBrokerSocket(): Promise<net.Socket> {
     const errorMessage = lastBrokerError?.message ? ` (${lastBrokerError.message})` : "";
     throw new Error(
       `Could not connect to local broker at ${SOCKET_PATH}${errorMessage}. ` +
-        "Run `npx @different-ai/opencode-browser install` and ensure the extension is loaded."
+        "Run `npx @ageless-h/opencode-browser install` and ensure the extension is loaded."
     );
   }
 
@@ -297,11 +297,11 @@ const plugin: Plugin = async (ctx) => {
       }),
 
       browser_version: tool({
-        description: "Return the installed @different-ai/opencode-browser plugin version.",
+        description: "Return the installed @ageless-h/opencode-browser plugin version.",
         args: {},
         async execute(args, ctx) {
           return JSON.stringify({
-            name: "@different-ai/opencode-browser",
+            name: "@ageless-h/opencode-browser",
             version: getPackageVersion(),
             sessionId,
             pid: process.pid,
@@ -843,7 +843,7 @@ const plugin: Plugin = async (ctx) => {
 
       browser_evaluate: tool({
         description:
-          "Read-only page evaluate (Codex playwright.evaluate). Pass expression string; optional selector scopes to element as `el`.",
+          "Execute arbitrary JavaScript in the page's main world (Codex playwright.evaluate) with FULL side-effect capability: it can mutate the DOM, read/write localStorage/cookies, fire network requests, click elements, and submit forms. NOT read-only — do not treat as a safe observation step. Prefer dedicated tools for actions (browser_click, browser_type, browser_fill, browser_select) and for observation (browser_query, browser_snapshot, browser_screenshot); use evaluate only when no dedicated tool suffices. Pass expression string; optional selector scopes to element as `el`. Returns the JSON-serialized result of the expression.",
         args: {
           expression: schema.string(),
           selector: schema.string().optional(),
