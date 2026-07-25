@@ -3388,8 +3388,54 @@ async function toolPress({ selector, key, keys, tabId, index, timeoutMs, pollMs 
   return { tabId: tab.id, content: JSON.stringify(result) }
 }
 
+// --- Trusted input via CDP (Codex browser-client parity: Input.dispatchMouseEvent) ---
+// Falls back to in-page synthetic dispatchEvent when the debugger is unavailable.
+
+const CDP_MOUSE_BUTTONS = { 1: "left", 2: "middle", 3: "right", 4: "back", 5: "forward" }
+// CDP `buttons` bitmask (Left=1, Right=2, Middle=4, Back=16, Forward=32).
+// mousePressed without `buttons` is silently dropped by some Chrome builds.
+const CDP_BUTTONS_MASK = { left: 1, right: 2, middle: 4, back: 16, forward: 32, none: 0 }
+
+function cdpModifierMask(keypress) {
+  if (!Array.isArray(keypress)) return 0
+  let mask = 0
+  for (const k of keypress) {
+    const key = String(k).toLowerCase()
+    if (key === "alt" || key === "option") mask |= 1
+    else if (key === "ctrl" || key === "control") mask |= 2
+    else if (key === "meta" || key === "cmd" || key === "command") mask |= 4
+    else if (key === "shift") mask |= 8
+  }
+  return mask
+}
+
+/** Attach debugger for input; returns null when unavailable (caller may fallback). */
+async function cdpInputSession(tabId) {
+  const state = await ensureDebuggerAttached(tabId)
+  if (!state?.attached) return null
+  return { tabId }
+}
+
+async function cdpDispatchMouse(tabId, type, { x, y, button = "none", clickCount = 0, modifiers = 0, buttons } = {}) {
+  const buttonsMask = buttons ?? (type === "mousePressed" ? CDP_BUTTONS_MASK[button] ?? 0 : 0)
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+    type,
+    x,
+    y,
+    button,
+    buttons: buttonsMask,
+    clickCount,
+    modifiers,
+  })
+}
+
 async function toolMouseMove({ x, y, tabId } = {}) {
   const tab = await getTabById(tabId)
+  const cdp = await cdpInputSession(tab.id)
+  if (cdp) {
+    await cdpDispatchMouse(tab.id, "mouseMoved", { x, y })
+    return { tabId: tab.id, content: JSON.stringify({ ok: true, x, y, method: "cdp" }) }
+  }
   const result = await runInPage(tab.id, "mouse_move", { x, y })
   if (!result?.ok) throw new Error(result?.error || "mouse_move failed")
   return { tabId: tab.id, content: JSON.stringify(result) }
@@ -3397,6 +3443,18 @@ async function toolMouseMove({ x, y, tabId } = {}) {
 
 async function toolMouseClick({ x, y, button = 1, keypress, tabId } = {}) {
   const tab = await getTabById(tabId)
+  const cdpButton = CDP_MOUSE_BUTTONS[button] || "left"
+  const modifiers = cdpModifierMask(keypress)
+  const cdp = await cdpInputSession(tab.id)
+  if (cdp) {
+    await cdpDispatchMouse(tab.id, "mouseMoved", { x, y, modifiers })
+    await cdpDispatchMouse(tab.id, "mousePressed", { x, y, button: cdpButton, clickCount: 1, modifiers })
+    await cdpDispatchMouse(tab.id, "mouseReleased", { x, y, button: cdpButton, clickCount: 1, modifiers })
+    return {
+      tabId: tab.id,
+      content: JSON.stringify({ ok: true, x, y, button: cdpButton, method: "cdp" }),
+    }
+  }
   const result = await runInPage(tab.id, "mouse_click", { x, y, button, keypress })
   if (!result?.ok) throw new Error(result?.error || "mouse_click failed")
   return { tabId: tab.id, content: JSON.stringify(result) }
@@ -3404,6 +3462,16 @@ async function toolMouseClick({ x, y, button = 1, keypress, tabId } = {}) {
 
 async function toolMouseDblclick({ x, y, keypress, tabId } = {}) {
   const tab = await getTabById(tabId)
+  const modifiers = cdpModifierMask(keypress)
+  const cdp = await cdpInputSession(tab.id)
+  if (cdp) {
+    await cdpDispatchMouse(tab.id, "mouseMoved", { x, y, modifiers })
+    await cdpDispatchMouse(tab.id, "mousePressed", { x, y, button: "left", clickCount: 1, modifiers })
+    await cdpDispatchMouse(tab.id, "mouseReleased", { x, y, button: "left", clickCount: 1, modifiers })
+    await cdpDispatchMouse(tab.id, "mousePressed", { x, y, button: "left", clickCount: 2, modifiers })
+    await cdpDispatchMouse(tab.id, "mouseReleased", { x, y, button: "left", clickCount: 2, modifiers })
+    return { tabId: tab.id, content: JSON.stringify({ ok: true, x, y, method: "cdp" }) }
+  }
   const result = await runInPage(tab.id, "mouse_dblclick", { x, y, keypress })
   if (!result?.ok) throw new Error(result?.error || "mouse_dblclick failed")
   return { tabId: tab.id, content: JSON.stringify(result) }
@@ -3412,6 +3480,24 @@ async function toolMouseDblclick({ x, y, keypress, tabId } = {}) {
 async function toolDrag({ path, keys, tabId } = {}) {
   if (!Array.isArray(path) || path.length < 2) throw new Error("path must be an array of at least 2 points")
   const tab = await getTabById(tabId)
+  const modifiers = cdpModifierMask(keys)
+  const start = path[0]
+  const end = path[path.length - 1]
+  const cdp = await cdpInputSession(tab.id)
+  if (cdp) {
+    await cdpDispatchMouse(tab.id, "mouseMoved", { x: start.x, y: start.y, modifiers })
+    await cdpDispatchMouse(tab.id, "mousePressed", { x: start.x, y: start.y, button: "left", clickCount: 1, modifiers })
+    for (const p of path.slice(1, -1)) {
+      await cdpDispatchMouse(tab.id, "mouseMoved", { x: p.x, y: p.y, modifiers })
+      await new Promise((r) => setTimeout(r, 30))
+    }
+    await cdpDispatchMouse(tab.id, "mouseMoved", { x: end.x, y: end.y, modifiers })
+    await cdpDispatchMouse(tab.id, "mouseReleased", { x: end.x, y: end.y, button: "left", clickCount: 1, modifiers })
+    return {
+      tabId: tab.id,
+      content: JSON.stringify({ ok: true, from: start, to: end, points: path.length, method: "cdp" }),
+    }
+  }
   const result = await runInPage(tab.id, "drag", { path, keys })
   if (!result?.ok) throw new Error(result?.error || "drag failed")
   return { tabId: tab.id, content: JSON.stringify(result) }
