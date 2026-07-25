@@ -1,275 +1,150 @@
 # OpenCode Browser
 
-Browser automation plugin for [OpenCode](https://opencode.ai).
+**让 OpenCode 接管你正在用的真实浏览器。**
 
-Control your real Chromium browser (Chrome/Brave/Arc/Edge) using your existing profile (logins, cookies, bookmarks). No DevTools Protocol, no security prompts.
+这是一个 OpenCode 插件 + Chrome 扩展：OpenCode 的 agent 通过它直接操作你自己的 Chrome/Edge/Brave —— 用的是**你日常登录着的那个浏览器**，你的登录态、Cookie、书签、已开的标签页都在。
 
+> Forked from [`different-ai/opencode-browser`](https://github.com/different-ai/opencode-browser)，本仓库为独立维护版本，已断开上游。
 
-https://github.com/user-attachments/assets/1496b3b3-419b-436c-b412-8cda2fed83d6
+## 为什么是"接管你自己的浏览器"
 
+很多 agent 浏览器方案会起一个干净的无头浏览器 —— 但那里没有你登录过的任何账号。一旦任务碰到需要登录的网站（邮箱、后台、内网系统、社交账号），agent 就卡住了。
 
-## Why this architecture
+本项目走另一条路：**正常的登录场景由你人来完成** —— 像平时一样打开 Chrome、扫码、输密码、过二次验证。登录完之后，agent 接管这个浏览器继续干活：
 
-This version is optimized for reliability and predictable multi-session behavior:
-- **No MCP** -> just opencode plugin
-- **No WebSocket port** → no port conflicts
-- **Chrome Native Messaging** between extension and a local host process
-- A local **broker** multiplexes multiple OpenCode plugin sessions and enforces **per-tab ownership**
-
-## Installation
-
-> Help me improve this! 
-
-```bash
-bunx @different-ai/opencode-browser@latest install
-```
-
-Supports macOS, Linux, and Windows (Chrome/Edge/Brave/Chromium).
-
-
-https://github.com/user-attachments/assets/d5767362-fbf3-4023-858b-90f06d9f0b25
-
-
-
-
-The installer will:
-
-1. Copy the extension to `~/.opencode-browser/extension/`
-2. Walk you through loading + pinning it in `chrome://extensions`
-3. Resolve a fixed extension ID (no copy/paste) and install a **Native Messaging Host manifest**
-4. Update your `opencode.json` or `opencode.jsonc` to load the plugin
-
-To override the extension ID, pass `--extension-id <id>` or set `OPENCODE_BROWSER_EXTENSION_ID`.
-
-### Configure OpenCode
-
-> Note: if you run the installer you'll be prompted to include this automatically. If you said "yes", you can skip this part.
-
-Your `opencode.json` or `opencode.jsonc` should contain:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@different-ai/opencode-browser"]
-}
-```
-
-### Update
-
-```bash
-bunx @different-ai/opencode-browser@latest update
-```
-
-## CLI tool runner (for local debugging)
-
-Run plugin tools directly from the package CLI (without starting an OpenCode session):
-
-```bash
-# list available browser_* tools
-npx @different-ai/opencode-browser tools
-
-# run a single tool
-npx @different-ai/opencode-browser tool browser_status
-npx @different-ai/opencode-browser tool browser_query --args '{"mode":"page_text"}'
-
-# run built-in end-to-end smoke test (click + text selector + container scroll)
-npx @different-ai/opencode-browser self-test
-```
-
-This is useful for debugging issue reports (for example inbox/chat UIs) before involving a full OpenCode workflow.
-After `update`, reload the unpacked extension in `chrome://extensions` before running `self-test`.
-
-## Chrome Web Store maintainer flow
-
-Build a store-ready extension package:
-
-```bash
-bun run build:cws
-```
-
-Outputs:
-
-- `artifacts/chrome-web-store/opencode-browser-cws-v<version>.zip`
-- `artifacts/chrome-web-store/manifest.chrome-web-store.json`
-
-Submission checklist and guidance:
-
-- `CHROME_WEB_STORE.md`
-- `CHROME_WEB_STORE_REQUEST_TEMPLATE.md`
-- `PRIVACY.md`
-
-## How it works
+- **你负责登录**：和日常使用完全一样，在真实 Chrome 里完成所有认证
+- **agent 负责操作**：导航、点击、填表、截图、抓取、下载，全部发生在你已登录的会话里
+- **不偷前台**：agent 默认在后台标签页工作（`active: false`），并归入一个独立的 Chrome 标签组，不打断你手头的事
+- **也能接管你已开的页**：`browser_claim_tab` 可以把你正在看的某个标签页交给 agent 继续操作
 
 ```
 OpenCode Plugin <-> Local Broker (unix socket) <-> Native Host <-> Chrome Extension
 ```
 
-- The extension connects to the native host.
-- The plugin talks to the broker over a local unix socket.
-- The broker forwards tool requests to the extension and enforces tab ownership.
+- **Extension**：装在你的 Chrome 里，通过 Chrome API 执行浏览器操作
+- **Native Host**：Chrome Native Messaging 桥
+- **Broker**：本地多路复用，多个 OpenCode 会话各自隔离、互不抢标签
+- **Plugin**：OpenCode 侧的 `browser_*` 工具集
 
-## Agent Browser mode (alpha)
+无需 DevTools Protocol，无端口冲突，无安全弹窗。
 
-This branch adds an alternate backend powered by `agent-browser` (Playwright). It runs headless and does **not** reuse your existing Chrome profile.
-
-### Enable locally
-
-1. Install `agent-browser` and Chromium:
+## 安装
 
 ```bash
-npm install -g agent-browser
-agent-browser install
+git clone https://github.com/ageless-h/opencode-browser.git
+cd opencode-browser
+bun install
+node bin/cli.js install
 ```
 
-2. Set the backend mode:
+支持 macOS、Linux、Windows（Chrome / Edge / Brave / Chromium）。
+
+安装器会：
+
+1. 把扩展复制到 `~/.opencode-browser/extension/`
+2. 引导你在 `chrome://extensions` 加载并固定扩展
+3. 解析固定扩展 ID 并安装 **Native Messaging Host manifest**
+4. 更新你的 `opencode.json` / `opencode.jsonc` 加载插件
+
+### 配置 OpenCode
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["file:///path/to/opencode-browser"]
+}
+```
+
+### 更新
 
 ```bash
-export OPENCODE_BROWSER_BACKEND=agent
+node bin/cli.js update
 ```
 
-Optional overrides:
-- `OPENCODE_BROWSER_AGENT_SESSION` (custom session name)
-- `OPENCODE_BROWSER_AGENT_SOCKET` (unix socket path)
-- `OPENCODE_BROWSER_AGENT_AUTOSTART=0` (disable auto-start)
-- `OPENCODE_BROWSER_AGENT_DAEMON` (explicit daemon path)
+然后到 `chrome://extensions` 点一下 Reload。
 
-### Tailnet/remote host
+## 典型用法
 
-On the host (e.g., `home-server.taild435d7.ts.net`), run the TCP gateway:
+```text
+你:   帮我看看 Gmail 有没有新的账单邮件，汇总一下金额
+agent: browser_open_tab → gmail.com（你已登录）→ 读取 → 汇总
+
+你:   这个页面你接着操作（你正看着一个后台系统）
+agent: browser_claim_tab → 接管当前标签页 → 继续填表/点审批
+```
+
+### CLI 调试
 
 ```bash
-OPENCODE_BROWSER_AGENT_GATEWAY_PORT=9833 node bin/agent-gateway.cjs
+npx . tools                    # 列出全部 browser_* 工具
+npx . tool browser_status      # 单跑一个工具
+npx . self-test                # 端到端冒烟
 ```
 
-On the client:
+## Chrome Web Store 打包（维护者）
 
 ```bash
-export OPENCODE_BROWSER_BACKEND=agent
-export OPENCODE_BROWSER_AGENT_HOST=home-server.taild435d7.ts.net
-export OPENCODE_BROWSER_AGENT_PORT=9833
+bun run build:cws
 ```
 
-## Per-tab ownership
+产物与提交清单见：
 
-- Each session owns its own tabs; tabs are never shared between sessions.
-- If a session has no tab yet, the broker auto-creates a **background** tab on first tool use (`active: false`).
-- `browser_open_tab` creates and claims an **agent** tab (default `active: false` — does not steal the user's foreground tab). Pass `active: true` only when you intentionally focus it.
-- `browser_claim_tab` claims an existing **user** tab and does **not** move it into the agent Chrome tab group.
-- Call `browser_name_session` early to name the session and create/update its Chrome tab group; subsequent agent tabs join that group.
-- `browser_mark_tab` + `browser_finalize` mirror Codex handoff/deliverable cleanup (explicit only; not automatic on disconnect).
-- Claims expire after inactivity (`OPENCODE_BROWSER_CLAIM_TTL_MS`, default 5 minutes).
-- Use `browser_status` or `browser_list_claims` for debugging (includes `origin` / `mark` / session `groupId`).
+- `docs/chrome-web-store/README.md`
+- `docs/chrome-web-store/REQUEST_TEMPLATE.md`
+- `PRIVACY.md`
 
-## Available tools
+## 会话与标签归属
 
-Core primitives:
-- `browser_status`
-- `browser_get_tabs` (includes `groupId` / `groupTitle` when present)
-- `browser_list_claims`
-- `browser_claim_tab`
-- `browser_release_tab`
-- `browser_name_session`
-- `browser_mark_tab`
-- `browser_finalize`
-- `browser_open_tab` (default `active: false`; joins session tab group)
-- `browser_close_tab`
-- `browser_set_active_tab` (only explicit way to steal foreground)
-- `browser_navigate`
-- `browser_back` / `browser_forward` / `browser_reload` (optional `bypassCache`)
-- `browser_query` (modes: `text`, `value`, `list`, `exists`, `page_text`; optional `timeoutMs`/`pollMs`)
-- `browser_click` (optional `timeoutMs`/`pollMs`)
-- `browser_type` (optional `timeoutMs`/`pollMs`)
-- `browser_select` (optional `timeoutMs`/`pollMs`)
-- `browser_fill` / `browser_dblclick` / `browser_check` / `browser_uncheck` / `browser_set_checked`
-- `browser_count` / `browser_is_visible` / `browser_is_enabled` / `browser_get_attribute` / `browser_text_content` / `browser_inner_text`
-- `browser_all_text_contents` (all matches; Codex `locator.allTextContents`)
-- `browser_wait_for` / `browser_wait_for_load_state` / `browser_wait_for_url`
-- `browser_evaluate` (read-only)
-- `browser_element_info` (`x`,`y` → Codex `playwright.elementInfo`)
-- `browser_export` (`html` | `text` | `domSnapshot`)
-- `browser_title` / `browser_url`
-- `browser_get_js_dialog`
-- `browser_clipboard_read_text` / `browser_clipboard_write_text` (Codex `tab.clipboard`; offscreen preferred)
-- `browser_screenshot` (optional `fullPage`, `clip:{x,y,width,height}`)
-- `browser_capabilities_list` (Codex capabilities discovery)
-- `browser_viewport_set` / `browser_viewport_reset` (Codex viewport capability; CDP)
-- `browser_locator_all` (Codex `locator.all`)
-- `browser_press` (Codex `locator.press`)
-- `browser_download_media` (Codex `locator.downloadMedia` / `dom_cua.downloadMedia`)
-- `browser_mouse_move` / `browser_mouse_click` / `browser_mouse_dblclick` / `browser_drag` (Codex CUA subset)
-- `browser_get_visible_dom` (Codex `dom_cua.get_visible_dom`)
-- `browser_element_screenshot` (Codex `playwright.elementScreenshot` metadata)
-- `browser_key` (keyboard press; optional selector/modifiers)
-- `browser_handle_dialog` (accept/dismiss JS dialogs; requires debugger)
-- `browser_scroll` (optional `timeoutMs`/`pollMs`)
-- `browser_wait`
+- 每个 OpenCode 会话拥有自己的标签页，互不共享
+- 会话没有标签时，broker 首次用工具时自动创建**后台**标签（`active: false`）
+- `browser_open_tab` 创建 agent 标签（默认不抢前台）并加入会话标签组
+- `browser_claim_tab` 接管用户已有标签，**不会**把它挪进 agent 标签组
+- `browser_name_session` 命名会话并创建/更新 Chrome 标签组；建组用的临时 `about:blank` 会在真实标签入组后自动清理
+- `browser_mark_tab` + `browser_finalize` 对齐 Codex 的 handoff/deliverable 清理
+- 闲置 claim 默认 5 分钟过期（`OPENCODE_BROWSER_CLAIM_TTL_MS`）
 
-Downloads:
-- `browser_download`
-- `browser_list_downloads`
+## 可用工具
 
-User context (Codex `browser.user.history`):
-- `browser_history` — high-sensitivity; use only when needed (`queries` / `from` / `to` / `limit`)
+**核心：**
+`browser_status` / `browser_get_tabs` / `browser_list_claims` / `browser_claim_tab` / `browser_release_tab` / `browser_name_session` / `browser_mark_tab` / `browser_finalize` / `browser_open_tab` / `browser_close_tab` / `browser_set_active_tab` / `browser_navigate` / `browser_back` / `browser_forward` / `browser_reload`
 
-Uploads:
-- `browser_set_file_input` (extension backend supports small files; use agent backend for larger uploads)
+**页面交互（Codex Playwright 子集）：**
+`browser_click` / `browser_type` / `browser_select` / `browser_fill` / `browser_dblclick` / `browser_check` / `browser_uncheck` / `browser_set_checked` / `browser_press` / `browser_key` / `browser_scroll` / `browser_wait` / `browser_wait_for` / `browser_wait_for_load_state` / `browser_wait_for_url` / `browser_handle_dialog` / `browser_get_js_dialog`
 
-Selector helpers (usable in `selector`):
-- `uid:e12` — stable id from the latest `browser_snapshot` (`data-opc-uid`)
-- `role:button`, `role:button[name=Submit]`, `role:textbox[name="Email"]` (implicit ARIA roles + optional name)
-- `label:Mailing Address: City`
-- `aria:Principal Address: City`
-- `placeholder:Search`, `name:email`, `text:Submit`, `id:foo`
-- `css:label:has(input)` to force CSS
+**查询与导出：**
+`browser_query` / `browser_count` / `browser_is_visible` / `browser_is_enabled` / `browser_get_attribute` / `browser_text_content` / `browser_inner_text` / `browser_all_text_contents` / `browser_locator_all` / `browser_evaluate` / `browser_export` / `browser_title` / `browser_url`
 
-Strict multi-match (actions: click/type/select/key+selector/highlight/set_file_input):
-- Omit `index` → require a unique match; if multiple, error includes `count` + `candidates` (index/uid/role/name/tag)
-- Pass `index` (0-based) to pick the nth match, or prefer `uid:eN` from snapshot
+**视觉与坐标（Codex CUA 子集）：**
+`browser_screenshot`（支持 `fullPage` / `clip`）/ `browser_snapshot` / `browser_highlight` / `browser_element_info` / `browser_element_screenshot` / `browser_mouse_move` / `browser_mouse_click` / `browser_mouse_dblclick` / `browser_drag` / `browser_get_visible_dom`
 
-Selector-based tools wait up to 2000ms by default; set `timeoutMs: 0` to disable.
+**系统能力：**
+`browser_clipboard_read_text` / `browser_clipboard_write_text`（offscreen）/ `browser_history`（高敏感，按需使用）/ `browser_download` / `browser_list_downloads` / `browser_download_media` / `browser_set_file_input` / `browser_capabilities_list` / `browser_viewport_set` / `browser_viewport_reset` / `browser_console` / `browser_errors` / `browser_version`
 
-Diagnostics:
-- `browser_snapshot` (stamps `data-opc-uid`, returns `uid`/`role`/`name`/form state per node)
-- `browser_screenshot`
-- `browser_console` / `browser_errors` (debugger)
-- `browser_version`
+**选择器（`selector` 参数）：**
+`uid:e12`（来自 snapshot）、`role:button[name=Submit]`、`label:...`、`aria:...`、`placeholder:...`、`name:...`、`text:...`、`id:...`、`css:...`
+
+**严格多匹配：** 操作类工具省略 `index` 时要求唯一匹配；多匹配会报错并返回 `count` + `candidates`，传 `index` 或用 `uid:eN` 消歧。
 
 ## Roadmap
 
-- [x] Add tab management tools (`browser_set_active_tab`)
-- [x] Add navigation helpers (`browser_back`, `browser_forward`, `browser_reload`)
-- [x] Add keyboard input tool (`browser_key`)
-- [x] Add JS dialog handling (`browser_handle_dialog`)
-- [x] Add download support (`browser_download`, `browser_list_downloads`)
-- [x] Add upload support (`browser_set_file_input`)
-- [x] P1: Snapshot/locator semantics (uid/role/name, multi-match count)
-- [x] P2: Session tab groups + default non-stealing active tab policy
-- [x] P3: `browser_history` (Codex `browser.user.history`; no domain allow/block hard gate)
-- [x] Codex Playwright subset (flat): count/is_visible/fill/check/waitFor*/evaluate/export/title/url/getJsDialog
-- [x] P4a: clipboard readText/writeText, screenshot fullPage/clip, all_text_contents, element_info
-- [x] P4b: capabilities_list + viewport set/reset (CDP); seed about:blank auto-drop
-- [x] P5: locator_all, press, download_media, CUA subset (mouse_move/click/dblclick/drag), get_visible_dom, element_screenshot metadata
-- [ ] Not mirrored (Codex extension unsupported / architecture-level): full locator object graph / frameLocator chain, Tabs.content batch, pageAssets, browserAuth, agent.browsers REPL
+- [x] P0–P3：导航/键盘/对话框、snapshot uid 定位、会话标签组、`browser_history`
+- [x] Playwright 子集（扁平工具）：count/fill/check/waitFor*/evaluate/export/title/url/getJsDialog
+- [x] P4a/P4b：clipboard（offscreen）、screenshot fullPage/clip、all_text_contents、element_info、capabilities_list、viewport set/reset
+- [x] P5：locator_all、press、download_media、CUA 子集（mouse_move/click/dblclick/drag）、get_visible_dom、element_screenshot
+- [ ] 不镜像（Codex extension 不支持或架构级）：完整 locator 对象图/frameLocator 链、Tabs.content batch、pageAssets、browserAuth、agent.browsers REPL
 
-## Troubleshooting
-
-**Extension says native host not available**
-- Re-run `npx @different-ai/opencode-browser install`
-- If you loaded a custom extension ID, rerun with `--extension-id <id>`
-
-**Tab ownership errors**
-- Errors usually mean you passed a `tabId` owned by another session
-- Use `browser_open_tab` to create a tab for your session (or omit `tabId` to use your default)
-- Use `browser_status` or `browser_list_claims` for debugging
-
-## Uninstall
+## 卸载
 
 ```bash
-npx @different-ai/opencode-browser uninstall
+node bin/cli.js uninstall
 ```
 
-Then remove the unpacked extension in `chrome://extensions` and remove the plugin from `opencode.json` or `opencode.jsonc`.
+然后在 `chrome://extensions` 移除扩展，并从 `opencode.json` 中删掉插件项。
 
-## Privacy
+## 隐私
 
-- Privacy policy: `PRIVACY.md`
+见 `PRIVACY.md`。
+
+## License
+
+MIT · 原作者 Benjamin Shafii（different-ai），本仓库独立维护。
