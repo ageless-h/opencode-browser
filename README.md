@@ -133,6 +133,27 @@ bun run build:cws
 - [x] P5：locator_all、press、download_media、CUA 子集（mouse_move/click/dblclick/drag）、get_visible_dom、element_screenshot
 - [ ] 不镜像（Codex extension 不支持或架构级）：完整 locator 对象图/frameLocator 链、Tabs.content batch、pageAssets、browserAuth、agent.browsers REPL
 
+## 排障
+
+**扩展提示 native host not available**
+- 重跑 `node bin/cli.js install`；若自定义过扩展 ID，加 `--extension-id <id>` 重跑
+
+**`Unknown op: name_session` / `Unknown op: mark_tab`**
+- 说明**正在跑的 broker 进程是旧的**（磁盘代码已更新，进程内存未热重载）。重启 broker：
+  ```bash
+  pkill -f ~/.opencode-browser/broker.cjs
+  rm -f ~/.opencode-browser/broker.sock
+  node ~/.opencode-browser/broker.cjs &
+  ```
+- claims、会话名、`groupId` 都在 broker 进程内存里，重启后丢失 —— 重跑 `browser_name_session` 即可
+- 经验法则：每次 `node bin/cli.js update` 后，**重启 broker + Reload 扩展** 两件一起做
+
+**标签归属错误（owned by another session）**
+- 该 tabId 属于别的会话；用 `browser_open_tab` 开新标签，或省略 `tabId` 用本会话默认标签
+- 用 `browser_status` / `browser_list_claims` 排查
+
+**推荐 SOP**：`browser_status`（确认 hostConnected / groupId）→ 先 `browser_name_session` → 再并行 `browser_open_tab(active:false)` → 结束时 `browser_mark_tab` / `browser_finalize`
+
 ## 卸载
 
 ```bash
