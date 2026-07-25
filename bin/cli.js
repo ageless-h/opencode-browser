@@ -1240,10 +1240,17 @@ async function status() {
 async function agentInstall() {
   header("Agent Browser Install");
 
-  const extraArgs = process.argv.slice(3).join(" ");
-  const command = `npx agent-browser install ${extraArgs}`.trim();
+  const npxBinary = OS_NAME === "win32" ? "npx.cmd" : "npx";
+  const args = ["agent-browser", "install", ...process.argv.slice(3)];
   try {
-    execSync(command, { stdio: "inherit" });
+    const result = spawnSync(npxBinary, args, {
+      stdio: "inherit",
+      shell: false,
+    });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(`${npxBinary} exited with status ${result.status ?? "unknown"}`);
+    }
     success("agent-browser install completed.");
   } catch (err) {
     error(`agent-browser install failed: ${err?.message || err}`);

@@ -4,6 +4,7 @@
 const net = require("net");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 const session =
@@ -20,10 +21,108 @@ function getPortForSession(name) {
   return 49152 + (Math.abs(hash) % 16383);
 }
 
-const host = process.env.OPENCODE_BROWSER_AGENT_GATEWAY_HOST || process.env.OPENCODE_BROWSER_AGENT_HOST || "0.0.0.0";
+const host = process.env.OPENCODE_BROWSER_AGENT_GATEWAY_HOST || process.env.OPENCODE_BROWSER_AGENT_HOST || "127.0.0.1";
 const port =
   Number(process.env.OPENCODE_BROWSER_AGENT_GATEWAY_PORT || process.env.OPENCODE_BROWSER_AGENT_PORT) ||
   getPortForSession(session);
+const gatewayToken = (process.env.OPENCODE_BROWSER_AGENT_GATEWAY_TOKEN || "").trim();
+
+function isLoopbackHost(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized === "[::1]" ||
+    normalized === "0:0:0:0:0:0:0:1" ||
+    /^127(?:\.\d{1,3}){3}$/.test(normalized) ||
+    /^::ffff:127(?:\.\d{1,3}){3}$/.test(normalized)
+  );
+}
+
+if (!isLoopbackHost(host) && gatewayToken.length < 32) {
+  console.error(
+    "[agent-gateway] Refusing non-loopback listen without OPENCODE_BROWSER_AGENT_GATEWAY_TOKEN " +
+      "(minimum 32 characters)."
+  );
+  process.exit(1);
+}
+
+function tokensEqual(actual, expected) {
+  const actualBuffer = Buffer.from(String(actual || ""), "utf8");
+  const expectedBuffer = Buffer.from(String(expected || ""), "utf8");
+  return (
+    actualBuffer.length === expectedBuffer.length &&
+    crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+  );
+}
+
+async function authenticateClient(client) {
+  if (!gatewayToken) return Buffer.alloc(0);
+
+  return await new Promise((resolve, reject) => {
+    const nonce = crypto.randomBytes(32).toString("base64url");
+    const expectedHmac = crypto
+      .createHmac("sha256", gatewayToken)
+      .update(nonce)
+      .digest("base64url");
+    let buffer = Buffer.alloc(0);
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Authentication timed out"));
+    }, 5000);
+
+    function cleanup() {
+      clearTimeout(timer);
+      client.off("data", onData);
+      client.off("close", onClose);
+      client.off("error", onError);
+    }
+
+    function onClose() {
+      cleanup();
+      reject(new Error("Client disconnected before authentication"));
+    }
+
+    function onError(err) {
+      cleanup();
+      reject(err);
+    }
+
+    function onData(chunk) {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length > 8192) {
+        cleanup();
+        reject(new Error("Authentication message too large"));
+        return;
+      }
+      const newline = buffer.indexOf(0x0a);
+      if (newline === -1) return;
+
+      let message;
+      try {
+        message = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
+      } catch {
+        cleanup();
+        reject(new Error("Invalid authentication message"));
+        return;
+      }
+      if (message?.type !== "auth" || !tokensEqual(message.hmac, expectedHmac)) {
+        cleanup();
+        reject(new Error("Authentication failed"));
+        return;
+      }
+      const remainder = buffer.subarray(newline + 1);
+      client.pause();
+      cleanup();
+      resolve(remainder);
+    }
+
+    client.on("data", onData);
+    client.once("close", onClose);
+    client.once("error", onError);
+    client.write(JSON.stringify({ type: "auth_challenge", nonce }) + "\n");
+  });
+}
 
 function resolveDaemonPath() {
   const override = process.env.OPENCODE_BROWSER_AGENT_DAEMON;
@@ -93,7 +192,10 @@ async function createAgentConnection() {
 const server = net.createServer(async (client) => {
   let upstream = null;
   try {
+    const remainder = await authenticateClient(client);
+    if (!gatewayToken) client.pause();
     upstream = await createAgentConnection();
+    if (remainder.length) upstream.write(remainder);
   } catch (err) {
     client.end();
     console.error("[agent-gateway] Connection failed:", err?.message || err);
@@ -102,6 +204,7 @@ const server = net.createServer(async (client) => {
 
   client.pipe(upstream);
   upstream.pipe(client);
+  client.resume();
 
   const close = () => {
     try {
@@ -126,4 +229,5 @@ server.on("error", (err) => {
 server.listen(port, host, () => {
   console.log(`[agent-gateway] Listening on ${host}:${port}`);
   console.log(`[agent-gateway] Proxying to ${socketPath}`);
+  if (gatewayToken) console.log("[agent-gateway] Token authentication enabled");
 });

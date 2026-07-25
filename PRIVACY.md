@@ -36,7 +36,8 @@ The plugin reads local files to satisfy file-upload requests. Fails closed:
   the OS temp directory are readable. Paths are resolved with `realpathSync` and
   the boundary is enforced after symlink resolution.
 - Extra roots can be added with the `OPENCODE_BROWSER_UPLOAD_DIRS` environment
-  variable (colon-separated absolute directories).
+  variable (absolute directories separated with the operating system PATH
+  delimiter: `;` on Windows, `:` on macOS/Linux).
 - Always refused, even inside allowed roots: `~/.ssh`, `~/.aws`, `~/.gnupg`,
   `~/.config/opencode`, `~/.opencode-browser`, `~/Library/Keychains`, any
   `.env*` path segment, and files named `id_rsa`, `id_ed25519`, `*.pem`, `*.key`.
@@ -54,6 +55,13 @@ The plugin reads local files to satisfy file-upload requests. Fails closed:
 - Local-only components: the broker (`bin/broker.cjs`) and the native messaging
   host (`bin/native-host.cjs`) communicate over a local unix socket / named pipe
   and Chrome Native Messaging. They make no network connections.
+- The optional agent-browser gateway (`bin/agent-gateway.cjs`) is a TCP bridge.
+  It listens only on `127.0.0.1` by default. A non-loopback bind is refused
+  unless a high-entropy `OPENCODE_BROWSER_AGENT_GATEWAY_TOKEN` is configured;
+  authentication uses a per-connection nonce and HMAC to prevent token
+  disclosure and replay. Remote gateway traffic can contain page data and
+  browser commands and should additionally be carried over a trusted encrypted
+  network such as a controlled VPN or SSH tunnel.
 - The extension contains no third-party analytics SDKs or ad trackers and does
   not send data to the extension authors.
 
@@ -80,8 +88,11 @@ still contain secrets displayed by the site.
 - Permission model difference: the unpacked build requests all permissions up
   front; the CWS build marks `debugger`, `downloads`, and `nativeMessaging`
   optional, moves `<all_urls>` host access to optional, and drops
-  `notifications`. Some tools fail with a clear error until the matching
-  optional permission is granted.
+  `notifications`. The first extension-icon click requests only
+  `nativeMessaging`; downloads, debugger, and site access remain independently
+  grantable in Chrome. Site-specific grants are accepted, so `<all_urls>` is
+  not required. Some tools fail with a clear error until their matching
+  optional permission or site access is granted.
 - Prompt-injection boundary: page content can contain instructions aimed at the
   agent. Prefer dedicated action tools (`browser_click`, `browser_type`,
   `browser_fill`, `browser_select`), which act on specific elements.

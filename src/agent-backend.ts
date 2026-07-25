@@ -1,9 +1,10 @@
 import net from "net";
-import { mkdirSync, readFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from "fs";
 import { homedir, tmpdir } from "os";
-import { basename, dirname, isAbsolute, join, resolve } from "path";
+import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "path";
 import { spawn } from "child_process";
 import { createRequire } from "module";
+import { createHmac } from "crypto";
 
 type AgentResponse =
   | { id: string; success: true; data: any }
@@ -59,6 +60,67 @@ function writeJsonLine(socket: net.Socket, msg: any): void {
   socket.write(JSON.stringify(msg) + "\n");
 }
 
+async function authenticateAgentGateway(socket: net.Socket, token: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let buffer = "";
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for agent gateway authentication challenge"));
+    }, 5000);
+
+    function cleanup(): void {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("close", onClose);
+      socket.off("error", onError);
+    }
+
+    function onClose(): void {
+      cleanup();
+      reject(new Error("Agent gateway closed before authentication"));
+    }
+
+    function onError(error: Error): void {
+      cleanup();
+      reject(error);
+    }
+
+    function onData(chunk: Buffer): void {
+      buffer += chunk.toString("utf8");
+      if (buffer.length > 8192) {
+        cleanup();
+        reject(new Error("Agent gateway authentication challenge is too large"));
+        return;
+      }
+      const newline = buffer.indexOf("\n");
+      if (newline === -1) return;
+      let message: any;
+      try {
+        message = JSON.parse(buffer.slice(0, newline));
+      } catch {
+        cleanup();
+        reject(new Error("Invalid agent gateway authentication challenge"));
+        return;
+      }
+      if (message?.type !== "auth_challenge" || typeof message.nonce !== "string") {
+        cleanup();
+        reject(new Error("Agent gateway did not provide an authentication challenge"));
+        return;
+      }
+      const hmac = createHmac("sha256", token)
+        .update(message.nonce)
+        .digest("base64url");
+      writeJsonLine(socket, { type: "auth", hmac });
+      cleanup();
+      resolve();
+    }
+
+    socket.on("data", onData);
+    socket.once("close", onClose);
+    socket.once("error", onError);
+  });
+}
+
 async function sleep(ms: number): Promise<void> {
   return await new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -106,6 +168,64 @@ function getAgentConnectionInfo(session: string): AgentConnectionInfo {
 
 function isLocalHost(host: string): boolean {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function nearestExistingAncestor(pathValue: string): string {
+  let current = pathValue;
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return current;
+}
+
+export function resolveAgentDownloadPath(
+  downloadsDir: string,
+  filename?: string,
+  urlValue?: string
+): string {
+  let name = typeof filename === "string" ? filename.trim() : "";
+  if (!name && typeof urlValue === "string") {
+    try {
+      const u = new URL(urlValue);
+      name = basename(u.pathname) || "";
+    } catch {
+      // ignore invalid URL and use a generated name below
+    }
+  }
+  if (!name) name = `download-${Date.now()}`;
+  if (name.includes("\0")) throw new Error("Download filename contains a null byte");
+  if (isAbsolute(name) || win32.isAbsolute(name)) {
+    throw new Error("Download filename must be relative to the configured downloads directory");
+  }
+
+  const root = realpathSync(downloadsDir);
+  const fullPath = resolve(root, name);
+  if (!isPathWithin(root, fullPath)) {
+    throw new Error("Download filename escapes the configured downloads directory");
+  }
+
+  const existingAncestor = nearestExistingAncestor(dirname(fullPath));
+  const realAncestor = realpathSync(existingAncestor);
+  if (!isPathWithin(root, realAncestor)) {
+    throw new Error("Download filename escapes the downloads directory through a symbolic link");
+  }
+  if (existsSync(fullPath) && lstatSync(fullPath).isSymbolicLink()) {
+    throw new Error("Refusing to overwrite a symbolic-link download target");
+  }
+
+  mkdirSync(dirname(fullPath), { recursive: true });
+  const realParent = realpathSync(dirname(fullPath));
+  if (!isPathWithin(root, realParent)) {
+    throw new Error("Download target parent escapes the configured downloads directory");
+  }
+  return fullPath;
 }
 
 function resolveAgentDaemonPath(): string | null {
@@ -376,6 +496,27 @@ function buildAgentOuterHtmlScript(selector: string, indexValue: number): string
   `);
 }
 
+function buildAgentFocusScript(selector: string, indexValue: number): string {
+  const payload = { selector, index: indexValue };
+  return buildEvalScript(`
+    const payload = ${JSON.stringify(payload)};
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll(payload.selector));
+    } catch {
+      return { ok: false, error: "Invalid selector" };
+    }
+    const element = nodes[payload.index];
+    if (!element) return { ok: false, error: "Element not found" };
+    if (typeof element.focus !== "function") return { ok: false, error: "Element is not focusable" };
+    element.focus();
+    return {
+      ok: document.activeElement === element,
+      error: document.activeElement === element ? undefined : "Element did not receive focus",
+    };
+  `);
+}
+
 function ensureEvalResult(result: any, fallback: string): any {
   if (!result || typeof result !== "object" || result.ok !== true) {
     const message = typeof result?.error === "string" ? result.error : fallback;
@@ -399,20 +540,7 @@ export function createAgentBackend(sessionId: string): AgentBackend {
   const downloads: Array<{ path: string; filename?: string; url?: string; timestamp: string }> = [];
 
   function resolveDownloadPath(filename?: string, urlValue?: string): string {
-    let name = typeof filename === "string" ? filename.trim() : "";
-    if (!name && typeof urlValue === "string") {
-      try {
-        const u = new URL(urlValue);
-        name = basename(u.pathname) || "";
-      } catch {
-        // ignore
-      }
-    }
-    if (!name) name = `download-${Date.now()}`;
-
-    const fullPath = isAbsolute(name) ? name : join(downloadsDir, name);
-    mkdirSync(dirname(fullPath), { recursive: true });
-    return fullPath;
+    return resolveAgentDownloadPath(downloadsDir, filename, urlValue);
   }
 
   function recordDownload(entry: { path: string; filename?: string; url?: string }): void {
@@ -430,7 +558,18 @@ export function createAgentBackend(sessionId: string): AgentBackend {
         connection.type === "unix"
           ? net.createConnection(connection.path)
           : net.createConnection({ host: connection.host, port: connection.port });
-      socket.once("connect", () => resolve(socket));
+      socket.once("connect", async () => {
+        const token = process.env.OPENCODE_BROWSER_AGENT_GATEWAY_TOKEN?.trim();
+        try {
+          if (connection.type === "tcp" && token) {
+            await authenticateAgentGateway(socket, token);
+          }
+          resolve(socket);
+        } catch (error) {
+          socket.destroy();
+          reject(error);
+        }
+      });
       socket.once("error", (err) => reject(err));
     });
   }
@@ -831,13 +970,51 @@ export function createAgentBackend(sessionId: string): AgentBackend {
       case "key": {
         return await withTab(args.tabId, async () => {
           if (!args.key) throw new Error("key is required");
-          // Prefer press when available; fall back to keyboard-style type for single keys.
-          try {
-            await agentCommand("press", { key: String(args.key) });
-          } catch {
-            await agentCommand("keyboard", { key: String(args.key) });
+          if (args.code !== undefined || args.keyCode !== undefined) {
+            throw new Error(
+              "agent-browser backend does not support browser_key code/keyCode overrides"
+            );
           }
-          return { content: JSON.stringify({ ok: true, key: String(args.key) }) };
+          if (args.repeat === true) {
+            throw new Error("agent-browser backend does not support browser_key repeat=true");
+          }
+          if (Number.isFinite(args.delayMs) && Number(args.delayMs) > 0) {
+            throw new Error("agent-browser backend does not support browser_key delayMs");
+          }
+
+          const chord = [
+            args.ctrlKey ? "Control" : null,
+            args.metaKey ? "Meta" : null,
+            args.altKey ? "Alt" : null,
+            args.shiftKey ? "Shift" : null,
+            String(args.key),
+          ]
+            .filter(Boolean)
+            .join("+");
+
+          const command: Record<string, any> = { key: chord };
+          if (typeof args.selector === "string" && args.selector) {
+            if (Number.isFinite(args.index)) {
+              ensureEvalResult(
+                await agentEvaluate(buildAgentFocusScript(args.selector, Number(args.index))),
+                "Could not focus browser_key target"
+              );
+            } else {
+              command.selector = args.selector;
+            }
+          }
+          await agentCommand("press", command);
+          return {
+            content: JSON.stringify({
+              ok: true,
+              key: String(args.key),
+              effectiveKey: chord,
+              selector: args.selector || null,
+              index: Number.isFinite(args.index) ? Number(args.index) : null,
+              backend: "agent-browser",
+              method: "press",
+            }),
+          };
         });
       }
       case "handle_dialog": {
@@ -992,7 +1169,15 @@ export function createAgentBackend(sessionId: string): AgentBackend {
       }
       case "screenshot": {
         return await withTab(args.tabId, async () => {
-          const data = await agentCommand("screenshot", { format: "png" });
+          if (args.clip !== undefined && args.clip !== null) {
+            throw new Error(
+              "agent-browser backend does not support browser_screenshot clip; use the extension backend"
+            );
+          }
+          const data = await agentCommand("screenshot", {
+            format: "png",
+            fullPage: args.fullPage === true,
+          });
           const base64 = data?.base64 ? String(data.base64) : "";
           if (!base64) throw new Error("Screenshot failed");
           return { content: `data:image/png;base64,${base64}` };

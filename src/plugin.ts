@@ -4,7 +4,7 @@ import net from "net";
 import { createAgentBackend, type AgentBackend } from "./agent-backend.js";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { homedir, tmpdir, userInfo } from "os";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "path";
+import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
@@ -118,7 +118,7 @@ function getAllowedUploadRoots(): string[] {
   const roots: string[] = [process.cwd(), tmpdir()];
   const extra = process.env.OPENCODE_BROWSER_UPLOAD_DIRS;
   if (extra) {
-    for (const part of extra.split(":")) {
+    for (const part of extra.split(delimiter)) {
       const dir = part.trim();
       if (dir && isAbsolute(dir)) roots.push(dir);
     }
@@ -172,7 +172,7 @@ function assertUploadAllowed(absPath: string): string {
       `Refusing to read file outside the allowed upload boundary: ${real}. ` +
         `Allowed roots: the workspace (${realpathOrSelf(process.cwd())}) and the OS temp dir (${realpathOrSelf(tmpdir())}). ` +
         `To allow this file, move it into the workspace or set OPENCODE_BROWSER_UPLOAD_DIRS ` +
-        `(colon-separated absolute directories).`
+        `(OS PATH-delimited absolute directories: ";" on Windows, ":" on macOS/Linux).`
     );
   }
   return real;
@@ -259,64 +259,88 @@ const BACKEND_MODE = (process.env.OPENCODE_BROWSER_BACKEND ?? process.env.OPENCO
 const USE_AGENT_BACKEND = ["agent", "agent-browser", "agentbrowser"].includes(BACKEND_MODE);
 
 let socket: net.Socket | null = null;
+let connectingPromise: Promise<net.Socket> | null = null;
 let lastBrokerError: Error | null = null;
 let sessionId = Math.random().toString(36).slice(2);
 let reqId = 0;
-const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+const pending = new Map<
+  number,
+  { socket: net.Socket; resolve: (v: any) => void; reject: (e: Error) => void }
+>();
 
 const agentBackend: AgentBackend | null = USE_AGENT_BACKEND ? createAgentBackend(sessionId) : null;
 
 async function ensureBrokerSocket(): Promise<net.Socket> {
   if (socket && !socket.destroyed) return socket;
+  if (connectingPromise) return await connectingPromise;
 
-  // Try to connect; if missing, try to start broker and retry.
-  try {
-    socket = await connectToBroker();
-  } catch {
-    maybeStartBroker();
-    for (let i = 0; i < 20; i++) {
-      await sleep(100);
-      try {
-        socket = await connectToBroker();
-        break;
-      } catch {}
+  connectingPromise = (async () => {
+    let connectedSocket: net.Socket | null = null;
+    // Try to connect; if missing, try to start broker and retry.
+    try {
+      connectedSocket = await connectToBroker();
+    } catch {
+      maybeStartBroker();
+      for (let i = 0; i < 20; i++) {
+        await sleep(100);
+        try {
+          connectedSocket = await connectToBroker();
+          break;
+        } catch {}
+      }
     }
-  }
 
-  if (!socket || socket.destroyed) {
-    const errorMessage = lastBrokerError?.message ? ` (${lastBrokerError.message})` : "";
-    throw new Error(
-      `Could not connect to local broker at ${SOCKET_PATH}${errorMessage}. ` +
-        "Run `npx @ageless-h/opencode-browser install` and ensure the extension is loaded."
+    if (!connectedSocket || connectedSocket.destroyed) {
+      const errorMessage = lastBrokerError?.message ? ` (${lastBrokerError.message})` : "";
+      throw new Error(
+        `Could not connect to local broker at ${SOCKET_PATH}${errorMessage}. ` +
+          "Run `npx @ageless-h/opencode-browser install` and ensure the extension is loaded."
+      );
+    }
+
+    socket = connectedSocket;
+    connectedSocket.setNoDelay(true);
+    logDebug(`broker connected socket=${SOCKET_PATH}`);
+    connectedSocket.on(
+      "data",
+      createJsonLineParser((msg) => {
+        if (msg?.type !== "response" || typeof msg.id !== "number") return;
+        const p = pending.get(msg.id);
+        if (!p || p.socket !== connectedSocket) return;
+        pending.delete(msg.id);
+        const res = msg as BrokerResponse;
+        if (!res.ok) p.reject(new Error(res.error));
+        else p.resolve(res.data);
+      })
     );
+
+    const rejectSocketPending = (reason: string) => {
+      for (const [id, p] of pending.entries()) {
+        if (p.socket !== connectedSocket) continue;
+        pending.delete(id);
+        p.reject(new Error(reason));
+      }
+    };
+
+    connectedSocket.on("close", () => {
+      rejectSocketPending("Broker connection closed");
+      if (socket === connectedSocket) socket = null;
+    });
+
+    connectedSocket.on("error", (err) => {
+      rejectSocketPending(`Broker connection error: ${err.message}`);
+      if (socket === connectedSocket) socket = null;
+    });
+
+    writeJsonLine(connectedSocket, { type: "hello", role: "plugin", sessionId, pid: process.pid });
+    return connectedSocket;
+  })();
+
+  try {
+    return await connectingPromise;
+  } finally {
+    connectingPromise = null;
   }
-
-  socket.setNoDelay(true);
-  logDebug(`broker connected socket=${SOCKET_PATH}`);
-  socket.on(
-    "data",
-    createJsonLineParser((msg) => {
-      if (msg?.type !== "response" || typeof msg.id !== "number") return;
-      const p = pending.get(msg.id);
-      if (!p) return;
-      pending.delete(msg.id);
-      const res = msg as BrokerResponse;
-      if (!res.ok) p.reject(new Error(res.error));
-      else p.resolve(res.data);
-    })
-  );
-
-  socket.on("close", () => {
-    socket = null;
-  });
-
-  socket.on("error", () => {
-    socket = null;
-  });
-
-  writeJsonLine(socket, { type: "hello", role: "plugin", sessionId, pid: process.pid });
-
-  return socket;
 }
 
 async function brokerRequest(op: string, payload: Record<string, any>): Promise<any> {
@@ -324,8 +348,14 @@ async function brokerRequest(op: string, payload: Record<string, any>): Promise<
   const id = ++reqId;
 
   return await new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
-    writeJsonLine(s, { type: "request", id, op, ...payload });
+    pending.set(id, { socket: s, resolve, reject });
+    try {
+      writeJsonLine(s, { type: "request", id, op, ...payload });
+    } catch (err) {
+      pending.delete(id);
+      reject(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
     setTimeout(() => {
       if (!pending.has(id)) return;
       pending.delete(id);
@@ -1464,7 +1494,8 @@ const plugin: Plugin = async (ctx) => {
           "omit index for strict unique match. " +
           "File reads are restricted: by default only files under the current workspace " +
           "(process.cwd()) and the OS temp dir are allowed; extra roots can be added via the " +
-          "OPENCODE_BROWSER_UPLOAD_DIRS env var (colon-separated absolute dirs). Credential " +
+          "OPENCODE_BROWSER_UPLOAD_DIRS env var (OS PATH-delimited absolute dirs: ';' on Windows, " +
+          "':' on macOS/Linux). Credential " +
           "locations (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/opencode, ~/.opencode-browser, " +
           "~/Library/Keychains), .env files, and key files (id_rsa, id_ed25519, *.pem, *.key) " +
           "are always refused. Only upload files the user explicitly asked to upload.",

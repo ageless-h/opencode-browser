@@ -98,6 +98,21 @@ npx . tool browser_status      # 单跑一个工具
 npx . self-test                # 端到端冒烟
 ```
 
+### Agent gateway（可选）
+
+`node bin/cli.js agent-gateway` 默认只监听 `127.0.0.1`。若确实需要让另一台机器连接，
+必须显式设置非 loopback host，并配置至少 32 字符的高熵共享 token：
+
+```bash
+export OPENCODE_BROWSER_AGENT_GATEWAY_HOST=0.0.0.0
+export OPENCODE_BROWSER_AGENT_GATEWAY_TOKEN='replace-with-a-random-32+-character-secret'
+node bin/cli.js agent-gateway
+```
+
+客户端设置相同的 `OPENCODE_BROWSER_AGENT_GATEWAY_TOKEN`。认证使用每连接随机 nonce 的
+HMAC challenge-response，token 不在网络上传输，旧响应不能重放。远程流量仍应只放在
+受信任的加密网络（例如受控 VPN/SSH tunnel）中；不要直接暴露到公网。
+
 ## Chrome Web Store 打包（维护者）
 
 ```bash

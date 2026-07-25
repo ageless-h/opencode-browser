@@ -1,12 +1,12 @@
 const NATIVE_HOST_NAME = "com.opencode.browser_automation"
 const KEEPALIVE_ALARM = "keepalive"
-const PERMISSION_HINT = "Click the OpenCode Browser extension icon and approve requested permissions."
-const OPTIONAL_RUNTIME_PERMISSIONS = ["nativeMessaging", "downloads", "debugger"]
-const OPTIONAL_RUNTIME_ORIGINS = ["<all_urls>"]
+const NATIVE_PERMISSION_HINT = "Click the OpenCode Browser extension icon and approve native messaging."
+const OPTIONAL_PERMISSION_HINT = "Grant this permission in the extension's Chrome settings."
+const SITE_ACCESS_HINT = "Grant this extension access to the current site in Chrome."
+const INITIAL_RUNTIME_PERMISSIONS = ["nativeMessaging"]
 
 const runtimeManifest = chrome.runtime.getManifest()
 const declaredOptionalPermissions = new Set(runtimeManifest.optional_permissions || [])
-const declaredOptionalOrigins = new Set(runtimeManifest.optional_host_permissions || [])
 
 let port = null
 let isConnected = false
@@ -38,28 +38,22 @@ async function hasDownloadsPermission() {
   return await hasPermissions({ permissions: ["downloads"] })
 }
 
-async function hasHostAccessPermission() {
-  return await hasPermissions({ origins: ["<all_urls>"] })
-}
-
 async function requestOptionalPermissionsFromClick() {
   if (!chrome.permissions?.contains || !chrome.permissions?.request) {
     return { granted: true, requested: false, permissions: [], origins: [] }
   }
 
   const permissions = []
-  for (const permission of OPTIONAL_RUNTIME_PERMISSIONS) {
+  for (const permission of INITIAL_RUNTIME_PERMISSIONS) {
     if (!declaredOptionalPermissions.has(permission)) continue
     const granted = await hasPermissions({ permissions: [permission] })
     if (!granted) permissions.push(permission)
   }
 
+  // Host access and high-risk debugger/downloads permissions remain
+  // independently controllable. Do not bundle them into the initial native
+  // messaging request.
   const origins = []
-  for (const origin of OPTIONAL_RUNTIME_ORIGINS) {
-    if (!declaredOptionalOrigins.has(origin)) continue
-    const granted = await hasPermissions({ origins: [origin] })
-    if (!granted) origins.push(origin)
-  }
 
   if (!permissions.length && !origins.length) {
     return { granted: true, requested: false, permissions, origins }
@@ -91,7 +85,7 @@ async function ensureDebuggerAvailable() {
   if (!granted) {
     return {
       ok: false,
-      reason: `Debugger permission not granted. ${PERMISSION_HINT}`,
+      reason: `Debugger permission not granted. ${OPTIONAL_PERMISSION_HINT}`,
     }
   }
 
@@ -100,12 +94,12 @@ async function ensureDebuggerAvailable() {
 
 async function ensureDownloadsAvailable() {
   if (!chrome.downloads) {
-    throw new Error(`Downloads API unavailable in this build. ${PERMISSION_HINT}`)
+    throw new Error(`Downloads API unavailable in this build. ${OPTIONAL_PERMISSION_HINT}`)
   }
 
   const granted = await hasDownloadsPermission()
   if (!granted) {
-    throw new Error(`Downloads permission not granted. ${PERMISSION_HINT}`)
+    throw new Error(`Downloads permission not granted. ${OPTIONAL_PERMISSION_HINT}`)
   }
 }
 
@@ -232,6 +226,7 @@ if (chrome.debugger?.onEvent) {
 
 if (chrome.debugger?.onDetach) {
   chrome.debugger.onDetach.addListener((source) => {
+    resetCdpMouseState(source.tabId)
     if (debuggerState.has(source.tabId)) {
       const state = debuggerState.get(source.tabId)
       state.attached = false
@@ -250,6 +245,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   // native port is momentarily disconnected, send() returns false and the
   // event is dropped — broker restart recovery handles state anyway.
   send({ type: "event", event: "tab_removed", tabId })
+})
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo?.status === "loading" || typeof changeInfo?.url === "string") {
+    resetCdpMouseState(tabId)
+  }
 })
 
 if (chrome.tabGroups?.onRemoved) {
@@ -282,7 +283,7 @@ async function connect() {
     updateBadge(false)
     if (!nativePermissionHintLogged) {
       nativePermissionHintLogged = true
-      console.log(`[OpenCode] Native messaging permission not granted. ${PERMISSION_HINT}`)
+      console.log(`[OpenCode] Native messaging permission not granted. ${NATIVE_PERMISSION_HINT}`)
     }
     return
   }
@@ -451,11 +452,6 @@ async function getTabById(tabId) {
 }
 
 async function runInPage(tabId, command, args) {
-  const hasHostAccess = await hasHostAccessPermission()
-  if (!hasHostAccess) {
-    throw new Error(`Site access permission not granted. ${PERMISSION_HINT}`)
-  }
-
   try {
     const result = await chrome.scripting.executeScript({
       target: { tabId },
@@ -467,7 +463,7 @@ async function runInPage(tabId, command, args) {
   } catch (error) {
     const message = error?.message || String(error)
     if (message.includes("Cannot access contents of the page")) {
-      throw new Error(`Site access permission not granted for this page. ${PERMISSION_HINT}`)
+      throw new Error(`Site access permission not granted for this page. ${SITE_ACCESS_HINT}`)
     }
     throw error
   }
@@ -670,6 +666,150 @@ async function pageOps(command, args) {
     return true
   }
 
+  function elementSummary(el) {
+    if (!el) return null
+    return {
+      tag: String(el.tagName || "").toLowerCase(),
+      id: el.id || null,
+      role: el.getAttribute?.("role") || getImplicitRole(el) || null,
+      name: getAccessibleName(el).slice(0, 120) || null,
+    }
+  }
+
+  function disabledReason(el) {
+    if (!el) return "Element is missing"
+    if (el.disabled === true) return "Element is disabled"
+    if (el.getAttribute?.("aria-disabled") === "true") return "Element is aria-disabled"
+    if (el.closest?.("[inert]")) return "Element is inert"
+    const style = el.ownerDocument?.defaultView?.getComputedStyle?.(el)
+    if (style?.pointerEvents === "none") return "Element has pointer-events:none"
+    return null
+  }
+
+  function scrollElementAndFrames(el) {
+    let current = el
+    while (current) {
+      try {
+        current.scrollIntoView({ block: "center", inline: "center" })
+      } catch {}
+      try {
+        current = current.ownerDocument?.defaultView?.frameElement || null
+      } catch {
+        current = null
+      }
+    }
+  }
+
+  function composedContains(target, candidate) {
+    let current = candidate
+    while (current) {
+      if (current === target) return true
+      if (current.parentNode) {
+        current = current.parentNode
+        continue
+      }
+      const root = current.getRootNode?.()
+      current = root?.host || null
+    }
+    return false
+  }
+
+  function mapFramePointToParent(frame, x, y) {
+    const localX = frame.clientLeft + x
+    const localY = frame.clientTop + y
+    const width = frame.offsetWidth
+    const height = frame.offsetHeight
+    const quads = frame.getBoxQuads?.()
+    const quad = quads?.[0]
+    if (quad && width > 0 && height > 0) {
+      const u = localX / width
+      const v = localY / height
+      return {
+        x:
+          quad.p1.x * (1 - u) * (1 - v) +
+          quad.p2.x * u * (1 - v) +
+          quad.p3.x * u * v +
+          quad.p4.x * (1 - u) * v,
+        y:
+          quad.p1.y * (1 - u) * (1 - v) +
+          quad.p2.y * u * (1 - v) +
+          quad.p3.y * u * v +
+          quad.p4.y * (1 - u) * v,
+      }
+    }
+
+    const rect = frame.getBoundingClientRect()
+    const scaleX = width > 0 ? rect.width / width : 1
+    const scaleY = height > 0 ? rect.height / height : 1
+    return {
+      x: rect.left + localX * scaleX,
+      y: rect.top + localY * scaleY,
+    }
+  }
+
+  function actionPointForElement(el) {
+    if (!isVisible(el)) {
+      return { ok: false, error: "Element is not visible or has zero area" }
+    }
+    const disabled = disabledReason(el)
+    if (disabled) return { ok: false, error: disabled }
+
+    let currentTarget = el
+    let currentDocument = el.ownerDocument
+    let rect = el.getBoundingClientRect()
+    let x = rect.left + rect.width / 2
+    let y = rect.top + rect.height / 2
+    const originalRect = { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+
+    while (currentDocument) {
+      const view = currentDocument.defaultView
+      if (!view || x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight) {
+        return { ok: false, error: "Element center is outside its frame viewport" }
+      }
+
+      const stack = currentDocument.elementsFromPoint?.(x, y) || []
+      const top = stack.find(
+        (candidate) =>
+          candidate &&
+          candidate !== currentDocument.documentElement &&
+          candidate !== currentDocument.body
+      )
+      if (
+        !top ||
+        (!composedContains(currentTarget, top) &&
+          !composedContains(top, currentTarget))
+      ) {
+        return {
+          ok: false,
+          error: "Element click point is intercepted",
+          interceptedBy: elementSummary(top),
+        }
+      }
+
+      let frame = null
+      try {
+        frame = view.frameElement
+      } catch {
+        return { ok: false, error: "Cross-origin iframe targets are unsupported" }
+      }
+      if (!frame) {
+        return { ok: true, x, y, rect: originalRect }
+      }
+
+      const frameRect = frame.getBoundingClientRect()
+      if (frameRect.width <= 0 || frameRect.height <= 0) {
+        return { ok: false, error: "Target iframe is not visible" }
+      }
+      const parentPoint = mapFramePointToParent(frame, x, y)
+      x = parentPoint.x
+      y = parentPoint.y
+      currentTarget = frame
+      currentDocument = frame.ownerDocument
+    }
+
+    return { ok: false, error: "Could not convert element coordinates to the top-level viewport" }
+  }
+
   function deepQuerySelectorAll(sel, rootDoc) {
     const out = []
     const seen = new Set()
@@ -868,8 +1008,11 @@ async function pageOps(command, args) {
       let chosen = null
       let ambiguous = false
       if (Number.isFinite(index)) {
-        chosen = pool[index] || matches[index] || null
-      } else if (strict && pool.length > 1) {
+        // Index always refers to the stable, complete locator result order.
+        // A hidden indexed item must fail actionability, never shift to a
+        // neighboring visible element.
+        chosen = matches[index] || null
+      } else if (strict && matches.length > 1) {
         ambiguous = true
         chosen = null
       } else {
@@ -877,7 +1020,7 @@ async function pageOps(command, args) {
       }
       return {
         selectorUsed: locator.raw,
-        matches: pool,
+        matches,
         allMatches: matches,
         chosen,
         ambiguous,
@@ -1031,20 +1174,43 @@ async function pageOps(command, args) {
     if (!match.chosen) {
       return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
     }
-    try {
-      match.chosen.scrollIntoView({ block: "center", inline: "center" })
-    } catch {}
-    const rect = match.chosen.getBoundingClientRect()
-    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1)
-    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1)
+    scrollElementAndFrames(match.chosen)
+    await new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    )
+    const first = actionPointForElement(match.chosen)
+    if (!first.ok) {
+      return {
+        ...first,
+        selectorUsed: match.selectorUsed,
+        uid: match.chosen.getAttribute?.("data-opc-uid") || null,
+      }
+    }
+    await new Promise((resolve) => requestAnimationFrame(resolve))
+    const second = actionPointForElement(match.chosen)
+    if (!second.ok) {
+      return {
+        ...second,
+        selectorUsed: match.selectorUsed,
+        uid: match.chosen.getAttribute?.("data-opc-uid") || null,
+      }
+    }
+    if (Math.abs(first.x - second.x) > 0.5 || Math.abs(first.y - second.y) > 0.5) {
+      return {
+        ok: false,
+        error: "Element position is not stable",
+        selectorUsed: match.selectorUsed,
+        uid: match.chosen.getAttribute?.("data-opc-uid") || null,
+      }
+    }
     return {
       ok: true,
       selectorUsed: match.selectorUsed,
       uid: match.chosen.getAttribute?.("data-opc-uid") || null,
       count: match.matches.length,
-      x,
-      y,
-      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      x: second.x,
+      y: second.y,
+      rect: second.rect,
     }
   }
 
@@ -1918,47 +2084,62 @@ async function pageOps(command, args) {
     }
     const el = match.chosen
     const type = (el.getAttribute?.("type") || "").toLowerCase()
+    const role = (el.getAttribute?.("role") || "").toLowerCase()
     const isCheckable =
       (el.tagName === "INPUT" && (type === "checkbox" || type === "radio")) ||
-      el.getAttribute?.("role") === "checkbox" ||
-      el.getAttribute?.("role") === "switch" ||
-      el.getAttribute?.("role") === "menuitemcheckbox"
+      role === "checkbox" ||
+      role === "switch" ||
+      role === "menuitemcheckbox"
 
-    if (!isCheckable && el.tagName !== "INPUT") {
-      // Try associated label control or clickable
+    if (!isCheckable) {
+      return {
+        ok: false,
+        error: `Element is not checkable: ${match.selectorUsed}`,
+        selectorUsed: match.selectorUsed,
+      }
+    }
+    const disabled = disabledReason(el)
+    if (disabled) {
+      return {
+        ok: false,
+        error: disabled,
+        selectorUsed: match.selectorUsed,
+      }
+    }
+    if (type === "radio" && want === false) {
+      return {
+        ok: false,
+        error: "Radio buttons cannot be unchecked directly; check another radio in the group",
+        selectorUsed: match.selectorUsed,
+      }
     }
 
-    try {
-      el.scrollIntoView({ block: "center", inline: "center" })
-    } catch {}
-
-    if (el.tagName === "INPUT" && (type === "checkbox" || type === "radio")) {
-      if (!!el.checked !== !!want) {
-        el.click()
-      }
-      if (!!el.checked !== !!want) {
-        el.checked = !!want
-        el.dispatchEvent(new Event("input", { bubbles: true }))
-        el.dispatchEvent(new Event("change", { bubbles: true }))
-      }
+    function observedChecked() {
+      if (el.tagName === "INPUT") return !!el.checked
+      const ariaChecked = el.getAttribute?.("aria-checked")
+      return ariaChecked === "true" || ariaChecked === "mixed"
+    }
+    const before = observedChecked()
+    if (options.inspectOnly === true || before === !!want) {
       return {
         ok: true,
         selectorUsed: match.selectorUsed,
-        checked: !!el.checked,
+        checked: before,
+        desired: !!want,
+        needsClick: before !== !!want,
         uid: el.getAttribute?.("data-opc-uid") || null,
       }
     }
 
-    // ARIA checkbox/switch
-    const ariaChecked = el.getAttribute?.("aria-checked")
-    const currently = ariaChecked === "true" || ariaChecked === "mixed"
-    if (currently !== !!want) {
-      el.click()
-    }
+    el.click()
+    const after = observedChecked()
     return {
-      ok: true,
+      ok: after === !!want,
+      error: after === !!want ? undefined : `Control state did not change (observed checked=${after})`,
       selectorUsed: match.selectorUsed,
-      checked: want,
+      checked: after,
+      desired: !!want,
+      needsClick: after !== !!want,
       uid: el.getAttribute?.("data-opc-uid") || null,
     }
   }
@@ -2748,6 +2929,46 @@ function formatActionError(result, fallback) {
   return result.error || fallback
 }
 
+async function activateSelectorWithCdp(tabId, args, clickCount = 1) {
+  const point = await runInPage(tabId, "resolve_point", args)
+  if (!point?.ok) throw new Error(formatActionError(point, "Click failed"))
+
+  const cdp = await cdpInputSession(tabId)
+  if (!cdp) return { trusted: false, point }
+
+  await cdpDispatchMouse(tabId, "mouseMoved", { x: point.x, y: point.y })
+  if (clickCount === 1) {
+    await cdpDispatchMouse(tabId, "mousePressed", {
+      x: point.x,
+      y: point.y,
+      button: "left",
+      clickCount: 1,
+    })
+    await cdpDispatchMouse(tabId, "mouseReleased", {
+      x: point.x,
+      y: point.y,
+      button: "left",
+      clickCount: 1,
+    })
+  } else {
+    for (let count = 1; count <= clickCount; count++) {
+      await cdpDispatchMouse(tabId, "mousePressed", {
+        x: point.x,
+        y: point.y,
+        button: "left",
+        clickCount: count,
+      })
+      await cdpDispatchMouse(tabId, "mouseReleased", {
+        x: point.x,
+        y: point.y,
+        button: "left",
+        clickCount: count,
+      })
+    }
+  }
+  return { trusted: true, point }
+}
+
 async function toolClick({ selector, tabId, index, timeoutMs, pollMs }) {
   if (!selector) throw new Error("Selector is required")
   const tab = await getTabById(tabId)
@@ -2759,14 +2980,9 @@ async function toolClick({ selector, tabId, index, timeoutMs, pollMs }) {
   // only the ACTIVATION becomes a trusted CDP mouse click at the element's
   // viewport center (synthetic MouseEvents are isTrusted:false and are
   // silently ignored by trusted-gated pages).
-  const point = await runInPage(tab.id, "resolve_point", args)
-  if (!point?.ok) throw new Error(formatActionError(point, "Click failed"))
-
-  const cdp = await cdpInputSession(tab.id)
-  if (cdp) {
-    await cdpDispatchMouse(tab.id, "mouseMoved", { x: point.x, y: point.y })
-    await cdpDispatchMouse(tab.id, "mousePressed", { x: point.x, y: point.y, button: "left", clickCount: 1 })
-    await cdpDispatchMouse(tab.id, "mouseReleased", { x: point.x, y: point.y, button: "left", clickCount: 1 })
+  const activation = await activateSelectorWithCdp(tab.id, args, 1)
+  const point = activation.point
+  if (activation.trusted) {
     const used = point.selectorUsed || selector
     const uid = point.uid ? ` uid=${point.uid}` : ""
     return { tabId: tab.id, content: `Clicked ${used}${uid}` }
@@ -2859,16 +3075,9 @@ async function toolDblclick({ selector, tabId, index, timeoutMs, pollMs }) {
   if (Number.isFinite(index)) args.index = index
 
   // Resolve in-page, then activate with two trusted CDP clicks at the center.
-  const point = await runInPage(tab.id, "resolve_point", args)
-  if (!point?.ok) throw new Error(formatActionError(point, "Double-click failed"))
-
-  const cdp = await cdpInputSession(tab.id)
-  if (cdp) {
-    await cdpDispatchMouse(tab.id, "mouseMoved", { x: point.x, y: point.y })
-    await cdpDispatchMouse(tab.id, "mousePressed", { x: point.x, y: point.y, button: "left", clickCount: 1 })
-    await cdpDispatchMouse(tab.id, "mouseReleased", { x: point.x, y: point.y, button: "left", clickCount: 1 })
-    await cdpDispatchMouse(tab.id, "mousePressed", { x: point.x, y: point.y, button: "left", clickCount: 2 })
-    await cdpDispatchMouse(tab.id, "mouseReleased", { x: point.x, y: point.y, button: "left", clickCount: 2 })
+  const activation = await activateSelectorWithCdp(tab.id, args, 2)
+  const point = activation.point
+  if (activation.trusted) {
     const used = point.selectorUsed || selector
     const uid = point.uid ? ` uid=${point.uid}` : ""
     return { tabId: tab.id, content: `Double-clicked ${used}${uid}` }
@@ -2890,34 +3099,82 @@ async function toolDblclick({ selector, tabId, index, timeoutMs, pollMs }) {
   }
 }
 
-async function toolCheck({ selector, tabId, index, timeoutMs, pollMs }) {
+async function setCheckedWithTrustedClick({
+  selector,
+  checked,
+  tabId,
+  index,
+  timeoutMs,
+  pollMs,
+}) {
   if (!selector) throw new Error("Selector is required")
   const tab = await getTabById(tabId)
-  const args = { selector, timeoutMs, pollMs }
+  const args = { selector, checked, timeoutMs, pollMs, inspectOnly: true }
   if (Number.isFinite(index)) args.index = index
-  const result = await runInPage(tab.id, "check", args)
-  if (!result?.ok) throw new Error(formatActionError(result, "Check failed"))
-  return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+  let result = await runInPage(tab.id, "set_checked", args)
+  if (!result?.ok) throw new Error(formatActionError(result, "set_checked failed"))
+  if (result.checked === checked) {
+    return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+  }
+
+  const activation = await activateSelectorWithCdp(tab.id, args, 1)
+  if (!activation.trusted) {
+    throw new Error(
+      `Changing checked state requires debugger permission for a trusted click. ${OPTIONAL_PERMISSION_HINT}`
+    )
+  }
+
+  const timeout = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 5000
+  const poll = Number.isFinite(pollMs) ? Math.max(20, pollMs) : 100
+  const deadline = Date.now() + timeout
+  while (true) {
+    result = await runInPage(tab.id, "set_checked", args)
+    if (!result?.ok) throw new Error(formatActionError(result, "set_checked failed"))
+    if (result.checked === checked) {
+      return {
+        tabId: tab.id,
+        content: JSON.stringify({ ...result, method: "cdp" }, null, 2),
+      }
+    }
+    if (Date.now() >= deadline) break
+    await new Promise((resolve) => setTimeout(resolve, poll))
+  }
+  throw new Error(
+    `Control state did not change to checked=${checked}; observed checked=${result.checked}`
+  )
+}
+
+async function toolCheck({ selector, tabId, index, timeoutMs, pollMs }) {
+  return await setCheckedWithTrustedClick({
+    selector,
+    checked: true,
+    tabId,
+    index,
+    timeoutMs,
+    pollMs,
+  })
 }
 
 async function toolUncheck({ selector, tabId, index, timeoutMs, pollMs }) {
-  if (!selector) throw new Error("Selector is required")
-  const tab = await getTabById(tabId)
-  const args = { selector, timeoutMs, pollMs }
-  if (Number.isFinite(index)) args.index = index
-  const result = await runInPage(tab.id, "uncheck", args)
-  if (!result?.ok) throw new Error(formatActionError(result, "Uncheck failed"))
-  return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+  return await setCheckedWithTrustedClick({
+    selector,
+    checked: false,
+    tabId,
+    index,
+    timeoutMs,
+    pollMs,
+  })
 }
 
 async function toolSetChecked({ selector, checked = true, tabId, index, timeoutMs, pollMs }) {
-  if (!selector) throw new Error("Selector is required")
-  const tab = await getTabById(tabId)
-  const args = { selector, checked, timeoutMs, pollMs }
-  if (Number.isFinite(index)) args.index = index
-  const result = await runInPage(tab.id, "set_checked", args)
-  if (!result?.ok) throw new Error(formatActionError(result, "set_checked failed"))
-  return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+  return await setCheckedWithTrustedClick({
+    selector,
+    checked: checked !== false,
+    tabId,
+    index,
+    timeoutMs,
+    pollMs,
+  })
 }
 
 async function toolFill({ selector, text, value, tabId, index, timeoutMs, pollMs }) {
@@ -3679,6 +3936,10 @@ function getCdpMouseState(tabId) {
   return state
 }
 
+function resetCdpMouseState(tabId) {
+  cdpMouseState.delete(tabId)
+}
+
 function cdpModifierMask(keypress) {
   if (!Array.isArray(keypress)) return 0
   let mask = 0
@@ -3700,32 +3961,41 @@ async function cdpInputSession(tabId) {
 }
 
 async function cdpDispatchMouse(tabId, type, { x, y, button = "none", clickCount = 0, modifiers = 0, buttons } = {}) {
-  const state = getCdpMouseState(tabId)
-  if (Number.isFinite(x)) state.x = x
-  if (Number.isFinite(y)) state.y = y
+  const previous = getCdpMouseState(tabId)
+  const next = { ...previous }
+  if (Number.isFinite(x)) next.x = x
+  if (Number.isFinite(y)) next.y = y
   // Keep the persistent button state in sync: pressed sets the bit (included
   // in the press event itself), released clears it before the release event,
   // and mouseMoved simply reports the current held buttons.
   if (type === "mousePressed" && button !== "none") {
-    state.buttons |= CDP_BUTTONS_MASK[button] ?? 0
-    state.button = button
+    next.buttons |= CDP_BUTTONS_MASK[button] ?? 0
+    next.button = button
   } else if (type === "mouseReleased" && button !== "none") {
-    state.buttons &= ~(CDP_BUTTONS_MASK[button] ?? 0)
-    if (!state.buttons) state.button = "none"
+    next.buttons &= ~(CDP_BUTTONS_MASK[button] ?? 0)
+    if (!next.buttons) next.button = "none"
   }
-  const buttonsMask = buttons ?? state.buttons
+  const buttonsMask = buttons ?? next.buttons
   // While a button is held (e.g. after press, before release in a drag),
   // mouseMoved must carry that button so the page sees a real drag.
-  const effectiveButton = button !== "none" ? button : state.button
-  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
-    type,
-    x,
-    y,
-    button: effectiveButton,
-    buttons: buttonsMask,
-    clickCount,
-    modifiers,
-  })
+  const effectiveButton = button !== "none" ? button : next.button
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type,
+      x: next.x,
+      y: next.y,
+      button: effectiveButton,
+      buttons: buttonsMask,
+      clickCount,
+      modifiers,
+    })
+    cdpMouseState.set(tabId, next)
+  } catch (error) {
+    // The browser may have detached after a press. Never carry an uncertain
+    // held-button state into a future debugger session.
+    resetCdpMouseState(tabId)
+    throw error
+  }
 }
 
 // --- Trusted keyboard via CDP (Input.dispatchKeyEvent) ---
@@ -3888,28 +4158,40 @@ function normalizeCdpModifierKey(name) {
 async function cdpKeyChord(tabId, keyList) {
   let modifiers = 0
   const downStack = []
-  for (const raw of keyList) {
-    const modKey = normalizeCdpModifierKey(raw)
-    if (modKey) modifiers |= cdpModifierMask([modKey])
-    const baseInfo = modKey ? { key: modKey, ...CDP_MODIFIER_KEY_INFO[modKey] } : cdpKeyInfo(String(raw))
-    const resolved = modKey ? { info: baseInfo, text: null, unmodifiedText: null } : resolveKeyText(baseInfo, modifiers)
-    // See cdpKeyPress: non-text keys need "keyDown" so accelerators fire on macOS.
-    await cdpDispatchKey(tabId, { type: resolved.text !== null ? "rawKeyDown" : "keyDown", ...resolved.info, modifiers })
-    if (resolved.text !== null) {
-      await cdpDispatchKey(tabId, {
-        type: "char",
-        ...resolved.info,
-        modifiers,
-        text: resolved.text,
-        unmodifiedText: resolved.unmodifiedText,
-      })
+  let failure = null
+  try {
+    for (const raw of keyList) {
+      const modKey = normalizeCdpModifierKey(raw)
+      if (modKey) modifiers |= cdpModifierMask([modKey])
+      const baseInfo = modKey ? { key: modKey, ...CDP_MODIFIER_KEY_INFO[modKey] } : cdpKeyInfo(String(raw))
+      const resolved = modKey ? { info: baseInfo, text: null, unmodifiedText: null } : resolveKeyText(baseInfo, modifiers)
+      // See cdpKeyPress: non-text keys need "keyDown" so accelerators fire on macOS.
+      await cdpDispatchKey(tabId, { type: resolved.text !== null ? "rawKeyDown" : "keyDown", ...resolved.info, modifiers })
+      downStack.push({ info: resolved.info, modKey })
+      if (resolved.text !== null) {
+        await cdpDispatchKey(tabId, {
+          type: "char",
+          ...resolved.info,
+          modifiers,
+          text: resolved.text,
+          unmodifiedText: resolved.unmodifiedText,
+        })
+      }
     }
-    downStack.push({ info: resolved.info, modifiers })
+  } catch (error) {
+    failure = error
   }
+
   for (let i = downStack.length - 1; i >= 0; i--) {
     const entry = downStack[i]
-    await cdpDispatchKey(tabId, { type: "keyUp", ...entry.info, modifiers: entry.modifiers })
+    if (entry.modKey) modifiers &= ~cdpModifierMask([entry.modKey])
+    try {
+      await cdpDispatchKey(tabId, { type: "keyUp", ...entry.info, modifiers })
+    } catch (error) {
+      if (!failure) failure = error
+    }
   }
+  if (failure) throw failure
 }
 
 async function toolMouseMove({ x, y, tabId } = {}) {
@@ -3968,14 +4250,32 @@ async function toolDrag({ path, keys, tabId } = {}) {
   const end = path[path.length - 1]
   const cdp = await cdpInputSession(tab.id)
   if (cdp) {
-    await cdpDispatchMouse(tab.id, "mouseMoved", { x: start.x, y: start.y, modifiers })
-    await cdpDispatchMouse(tab.id, "mousePressed", { x: start.x, y: start.y, button: "left", clickCount: 1, modifiers })
-    for (const p of path.slice(1, -1)) {
-      await cdpDispatchMouse(tab.id, "mouseMoved", { x: p.x, y: p.y, modifiers })
-      await new Promise((r) => setTimeout(r, 30))
+    let pressed = false
+    try {
+      await cdpDispatchMouse(tab.id, "mouseMoved", { x: start.x, y: start.y, modifiers })
+      await cdpDispatchMouse(tab.id, "mousePressed", { x: start.x, y: start.y, button: "left", clickCount: 1, modifiers })
+      pressed = true
+      for (const p of path.slice(1, -1)) {
+        await cdpDispatchMouse(tab.id, "mouseMoved", { x: p.x, y: p.y, modifiers })
+        await new Promise((r) => setTimeout(r, 30))
+      }
+      await cdpDispatchMouse(tab.id, "mouseMoved", { x: end.x, y: end.y, modifiers })
+      await cdpDispatchMouse(tab.id, "mouseReleased", { x: end.x, y: end.y, button: "left", clickCount: 1, modifiers })
+      pressed = false
+    } finally {
+      if (pressed) {
+        try {
+          await cdpDispatchMouse(tab.id, "mouseReleased", {
+            x: end.x,
+            y: end.y,
+            button: "left",
+            clickCount: 1,
+            modifiers,
+          })
+        } catch {}
+      }
+      resetCdpMouseState(tab.id)
     }
-    await cdpDispatchMouse(tab.id, "mouseMoved", { x: end.x, y: end.y, modifiers })
-    await cdpDispatchMouse(tab.id, "mouseReleased", { x: end.x, y: end.y, button: "left", clickCount: 1, modifiers })
     return {
       tabId: tab.id,
       content: JSON.stringify({ ok: true, from: start, to: end, points: path.length, method: "cdp" }),
@@ -4363,12 +4663,51 @@ function normalizeDownloadTimeoutMs(value) {
   return clampNumber(value, 0, 60000, 60000)
 }
 
-function waitForNextDownloadCreated(timeoutMs) {
+function waitForNextDownloadCreated({ timeoutMs, tabId, pageUrl, startedAt }) {
   const timeout = normalizeDownloadTimeoutMs(timeoutMs)
-  return new Promise((resolve, reject) => {
-    const listener = (item) => {
+  let cleanup = () => {}
+  let cancel = () => {}
+  const promise = new Promise((resolve, reject) => {
+    let tabDownload = null
+    const candidates = []
+
+    function filenamePart(value) {
+      return String(value || "").split(/[\\/]/).pop()
+    }
+
+    function matchesTabDownload(item) {
+      if (!tabDownload) return false
+      const eventUrl = String(tabDownload.url || "")
+      const itemUrls = [item?.url, item?.finalUrl].map((value) => String(value || ""))
+      if (eventUrl && itemUrls.includes(eventUrl)) return true
+      const suggested = filenamePart(tabDownload.suggestedFilename)
+      return !!suggested && filenamePart(item?.filename) === suggested
+    }
+
+    function tryResolve() {
+      if (!tabDownload) return
+      const matched = candidates.find(matchesTabDownload)
+      if (!matched) return
       cleanup()
-      resolve(item)
+      resolve(matched)
+    }
+
+    const listener = (item) => {
+      if (item?.byExtensionId && item.byExtensionId !== chrome.runtime.id) return
+      if (Number.isFinite(item?.tabId) && item.tabId !== tabId) return
+      const itemStartedAt = Date.parse(item?.startTime || "")
+      if (Number.isFinite(itemStartedAt) && itemStartedAt + 1000 < startedAt) return
+      candidates.push(item)
+      tryResolve()
+    }
+
+    const debuggerListener = (source, method, params) => {
+      if (source?.tabId !== tabId || method !== "Page.downloadWillBegin") return
+      tabDownload = {
+        url: params?.url || "",
+        suggestedFilename: params?.suggestedFilename || "",
+      }
+      tryResolve()
     }
 
     const timer = timeout
@@ -4378,14 +4717,24 @@ function waitForNextDownloadCreated(timeoutMs) {
         }, timeout)
       : null
 
-    function cleanup() {
+    cleanup = () => {
       chrome.downloads.onCreated.removeListener(listener)
+      chrome.debugger?.onEvent?.removeListener(debuggerListener)
       if (timer) clearTimeout(timer)
     }
 
+    cancel = () => {
+      cleanup()
+      resolve(null)
+    }
+
     chrome.downloads.onCreated.addListener(listener)
+    chrome.debugger?.onEvent?.addListener(debuggerListener)
   })
+  return { promise, cancel }
 }
+
+const selectorDownloadLocks = new Set()
 
 async function getDownloadById(downloadId) {
   const items = await chrome.downloads.search({ id: downloadId })
@@ -4437,11 +4786,34 @@ async function toolDownload({
     downloadId = await chrome.downloads.download(options)
   } else {
     const tab = await getTabById(tabId)
-    const created = waitForNextDownloadCreated(downloadTimeoutMs)
-    const clicked = await runInPage(tab.id, "click", { selector, index, timeoutMs, pollMs })
-    if (!clicked?.ok) throw new Error(clicked?.error || "Click failed")
-    const createdItem = await created
-    downloadId = createdItem?.id
+    if (selectorDownloadLocks.has(tab.id)) {
+      throw new Error(`Another selector download is already pending for tab ${tab.id}`)
+    }
+    selectorDownloadLocks.add(tab.id)
+    const startedAt = Date.now()
+    const waiter = waitForNextDownloadCreated({
+      timeoutMs: downloadTimeoutMs,
+      tabId: tab.id,
+      pageUrl: tab.url,
+      startedAt,
+    })
+    try {
+      const activation = await activateSelectorWithCdp(
+        tab.id,
+        { selector, index, timeoutMs, pollMs },
+        1
+      )
+      if (!activation.trusted) {
+        throw new Error(
+          `Selector download requires debugger permission for a trusted click. ${OPTIONAL_PERMISSION_HINT}`
+        )
+      }
+      const createdItem = await waiter.promise
+      downloadId = createdItem?.id
+    } finally {
+      waiter.cancel()
+      selectorDownloadLocks.delete(tab.id)
+    }
   }
 
   if (!Number.isFinite(downloadId)) throw new Error("Download did not start")

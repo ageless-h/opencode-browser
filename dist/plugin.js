@@ -12338,11 +12338,12 @@ import net2 from "net";
 
 // src/agent-backend.ts
 import net from "net";
-import { mkdirSync, readFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from "fs";
 import { homedir, tmpdir } from "os";
-import { basename, dirname, isAbsolute, join, resolve } from "path";
+import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "path";
 import { spawn } from "child_process";
 import { createRequire } from "module";
+import { createHmac } from "crypto";
 var agentRequire = createRequire(import.meta.url);
 var REQUEST_TIMEOUT_MS = 60000;
 var DEFAULT_PAGE_TEXT_LIMIT = 20000;
@@ -12372,6 +12373,61 @@ function createJsonLineParser(onMessage) {
 function writeJsonLine(socket, msg) {
   socket.write(JSON.stringify(msg) + `
 `);
+}
+async function authenticateAgentGateway(socket, token) {
+  await new Promise((resolve2, reject) => {
+    let buffer = "";
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for agent gateway authentication challenge"));
+    }, 5000);
+    function cleanup() {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("close", onClose);
+      socket.off("error", onError);
+    }
+    function onClose() {
+      cleanup();
+      reject(new Error("Agent gateway closed before authentication"));
+    }
+    function onError(error45) {
+      cleanup();
+      reject(error45);
+    }
+    function onData(chunk) {
+      buffer += chunk.toString("utf8");
+      if (buffer.length > 8192) {
+        cleanup();
+        reject(new Error("Agent gateway authentication challenge is too large"));
+        return;
+      }
+      const newline = buffer.indexOf(`
+`);
+      if (newline === -1)
+        return;
+      let message;
+      try {
+        message = JSON.parse(buffer.slice(0, newline));
+      } catch {
+        cleanup();
+        reject(new Error("Invalid agent gateway authentication challenge"));
+        return;
+      }
+      if (message?.type !== "auth_challenge" || typeof message.nonce !== "string") {
+        cleanup();
+        reject(new Error("Agent gateway did not provide an authentication challenge"));
+        return;
+      }
+      const hmac = createHmac("sha256", token).update(message.nonce).digest("base64url");
+      writeJsonLine(socket, { type: "auth", hmac });
+      cleanup();
+      resolve2();
+    }
+    socket.on("data", onData);
+    socket.once("close", onClose);
+    socket.once("error", onError);
+  });
 }
 async function sleep(ms) {
   return await new Promise((resolve2) => setTimeout(resolve2, ms));
@@ -12414,6 +12470,55 @@ function getAgentConnectionInfo(session) {
 }
 function isLocalHost(host) {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+function isPathWithin(root, candidate) {
+  const rel = relative(root, candidate);
+  return rel === "" || !rel.startsWith("..") && !isAbsolute(rel);
+}
+function nearestExistingAncestor(pathValue) {
+  let current = pathValue;
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current)
+      break;
+    current = parent;
+  }
+  return current;
+}
+function resolveAgentDownloadPath(downloadsDir, filename, urlValue) {
+  let name = typeof filename === "string" ? filename.trim() : "";
+  if (!name && typeof urlValue === "string") {
+    try {
+      const u = new URL(urlValue);
+      name = basename(u.pathname) || "";
+    } catch {}
+  }
+  if (!name)
+    name = `download-${Date.now()}`;
+  if (name.includes("\x00"))
+    throw new Error("Download filename contains a null byte");
+  if (isAbsolute(name) || win32.isAbsolute(name)) {
+    throw new Error("Download filename must be relative to the configured downloads directory");
+  }
+  const root = realpathSync(downloadsDir);
+  const fullPath = resolve(root, name);
+  if (!isPathWithin(root, fullPath)) {
+    throw new Error("Download filename escapes the configured downloads directory");
+  }
+  const existingAncestor = nearestExistingAncestor(dirname(fullPath));
+  const realAncestor = realpathSync(existingAncestor);
+  if (!isPathWithin(root, realAncestor)) {
+    throw new Error("Download filename escapes the downloads directory through a symbolic link");
+  }
+  if (existsSync(fullPath) && lstatSync(fullPath).isSymbolicLink()) {
+    throw new Error("Refusing to overwrite a symbolic-link download target");
+  }
+  mkdirSync(dirname(fullPath), { recursive: true });
+  const realParent = realpathSync(dirname(fullPath));
+  if (!isPathWithin(root, realParent)) {
+    throw new Error("Download target parent escapes the configured downloads directory");
+  }
+  return fullPath;
 }
 function resolveAgentDaemonPath() {
   const override = process.env.OPENCODE_BROWSER_AGENT_DAEMON?.trim();
@@ -12666,6 +12771,26 @@ function buildAgentOuterHtmlScript(selector, indexValue) {
     return { ok: true, value: element.outerHTML };
   `);
 }
+function buildAgentFocusScript(selector, indexValue) {
+  const payload = { selector, index: indexValue };
+  return buildEvalScript(`
+    const payload = ${JSON.stringify(payload)};
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll(payload.selector));
+    } catch {
+      return { ok: false, error: "Invalid selector" };
+    }
+    const element = nodes[payload.index];
+    if (!element) return { ok: false, error: "Element not found" };
+    if (typeof element.focus !== "function") return { ok: false, error: "Element is not focusable" };
+    element.focus();
+    return {
+      ok: document.activeElement === element,
+      error: document.activeElement === element ? undefined : "Element did not receive focus",
+    };
+  `);
+}
 function ensureEvalResult(result, fallback) {
   if (!result || typeof result !== "object" || result.ok !== true) {
     const message = typeof result?.error === "string" ? result.error : fallback;
@@ -12685,18 +12810,7 @@ function createAgentBackend(sessionId) {
   mkdirSync(downloadsDir, { recursive: true });
   const downloads = [];
   function resolveDownloadPath(filename, urlValue) {
-    let name = typeof filename === "string" ? filename.trim() : "";
-    if (!name && typeof urlValue === "string") {
-      try {
-        const u = new URL(urlValue);
-        name = basename(u.pathname) || "";
-      } catch {}
-    }
-    if (!name)
-      name = `download-${Date.now()}`;
-    const fullPath = isAbsolute(name) ? name : join(downloadsDir, name);
-    mkdirSync(dirname(fullPath), { recursive: true });
-    return fullPath;
+    return resolveAgentDownloadPath(downloadsDir, filename, urlValue);
   }
   function recordDownload(entry) {
     downloads.unshift({ ...entry, timestamp: new Date().toISOString() });
@@ -12709,7 +12823,18 @@ function createAgentBackend(sessionId) {
   async function connectToAgent() {
     return await new Promise((resolve2, reject) => {
       const socket = connection.type === "unix" ? net.createConnection(connection.path) : net.createConnection({ host: connection.host, port: connection.port });
-      socket.once("connect", () => resolve2(socket));
+      socket.once("connect", async () => {
+        const token = process.env.OPENCODE_BROWSER_AGENT_GATEWAY_TOKEN?.trim();
+        try {
+          if (connection.type === "tcp" && token) {
+            await authenticateAgentGateway(socket, token);
+          }
+          resolve2(socket);
+        } catch (error45) {
+          socket.destroy();
+          reject(error45);
+        }
+      });
       socket.once("error", (err) => reject(err));
     });
   }
@@ -13067,12 +13192,42 @@ function createAgentBackend(sessionId) {
         return await withTab(args.tabId, async () => {
           if (!args.key)
             throw new Error("key is required");
-          try {
-            await agentCommand("press", { key: String(args.key) });
-          } catch {
-            await agentCommand("keyboard", { key: String(args.key) });
+          if (args.code !== undefined || args.keyCode !== undefined) {
+            throw new Error("agent-browser backend does not support browser_key code/keyCode overrides");
           }
-          return { content: JSON.stringify({ ok: true, key: String(args.key) }) };
+          if (args.repeat === true) {
+            throw new Error("agent-browser backend does not support browser_key repeat=true");
+          }
+          if (Number.isFinite(args.delayMs) && Number(args.delayMs) > 0) {
+            throw new Error("agent-browser backend does not support browser_key delayMs");
+          }
+          const chord = [
+            args.ctrlKey ? "Control" : null,
+            args.metaKey ? "Meta" : null,
+            args.altKey ? "Alt" : null,
+            args.shiftKey ? "Shift" : null,
+            String(args.key)
+          ].filter(Boolean).join("+");
+          const command = { key: chord };
+          if (typeof args.selector === "string" && args.selector) {
+            if (Number.isFinite(args.index)) {
+              ensureEvalResult(await agentEvaluate(buildAgentFocusScript(args.selector, Number(args.index))), "Could not focus browser_key target");
+            } else {
+              command.selector = args.selector;
+            }
+          }
+          await agentCommand("press", command);
+          return {
+            content: JSON.stringify({
+              ok: true,
+              key: String(args.key),
+              effectiveKey: chord,
+              selector: args.selector || null,
+              index: Number.isFinite(args.index) ? Number(args.index) : null,
+              backend: "agent-browser",
+              method: "press"
+            })
+          };
         });
       }
       case "handle_dialog": {
@@ -13215,7 +13370,13 @@ function createAgentBackend(sessionId) {
       }
       case "screenshot": {
         return await withTab(args.tabId, async () => {
-          const data = await agentCommand("screenshot", { format: "png" });
+          if (args.clip !== undefined && args.clip !== null) {
+            throw new Error("agent-browser backend does not support browser_screenshot clip; use the extension backend");
+          }
+          const data = await agentCommand("screenshot", {
+            format: "png",
+            fullPage: args.fullPage === true
+          });
           const base643 = data?.base64 ? String(data.base64) : "";
           if (!base643)
             throw new Error("Screenshot failed");
@@ -13290,9 +13451,9 @@ function createAgentBackend(sessionId) {
 }
 
 // src/plugin.ts
-import { appendFileSync, existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync2, realpathSync, statSync } from "fs";
+import { appendFileSync, existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "fs";
 import { homedir as homedir2, tmpdir as tmpdir2, userInfo } from "os";
-import { basename as basename2, dirname as dirname2, extname, isAbsolute as isAbsolute2, join as join2, relative, resolve as resolve2, sep } from "path";
+import { basename as basename2, delimiter, dirname as dirname2, extname, isAbsolute as isAbsolute2, join as join2, relative as relative2, resolve as resolve2, sep } from "path";
 import { spawn as spawn2 } from "child_process";
 import { fileURLToPath } from "url";
 var __filename2 = fileURLToPath(import.meta.url);
@@ -13357,13 +13518,13 @@ function resolveUploadPath(filePath) {
 var BLOCKED_UPLOAD_BASENAMES = new Set(["id_rsa", "id_ed25519"]);
 var BLOCKED_UPLOAD_EXTENSIONS = new Set([".pem", ".key"]);
 var ENV_FILE_SEGMENT_RE = /^\.env($|\.)/i;
-function isPathWithin(child, parent) {
-  const rel = relative(parent, child);
+function isPathWithin2(child, parent) {
+  const rel = relative2(parent, child);
   return rel === "" || !rel.startsWith("..") && !isAbsolute2(rel);
 }
 function realpathOrSelf(p) {
   try {
-    return realpathSync(p);
+    return realpathSync2(p);
   } catch {
     return p;
   }
@@ -13389,7 +13550,7 @@ function getAllowedUploadRoots() {
   const roots = [process.cwd(), tmpdir2()];
   const extra = process.env.OPENCODE_BROWSER_UPLOAD_DIRS;
   if (extra) {
-    for (const part of extra.split(":")) {
+    for (const part of extra.split(delimiter)) {
       const dir = part.trim();
       if (dir && isAbsolute2(dir))
         roots.push(dir);
@@ -13406,12 +13567,12 @@ function getAllowedUploadRoots() {
 function assertUploadAllowed(absPath) {
   let real;
   try {
-    real = realpathSync(absPath);
+    real = realpathSync2(absPath);
   } catch {
     throw new Error(`Cannot read file: ${absPath}`);
   }
   for (const blockedDir of getBlockedUploadDirs()) {
-    if (isPathWithin(real, blockedDir)) {
+    if (isPathWithin2(real, blockedDir)) {
       throw new Error(`Refusing to read sensitive path: ${real}. This location is always blocked ` + `(credential/config directories such as ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/opencode, ` + `~/.opencode-browser, ~/Library/Keychains) regardless of upload boundary settings.`);
     }
   }
@@ -13426,8 +13587,8 @@ function assertUploadAllowed(absPath) {
     throw new Error(`Refusing to read sensitive file: ${real}. Private keys and certificate files ` + `(id_rsa, id_ed25519, *.pem, *.key) are always blocked.`);
   }
   const roots = getAllowedUploadRoots();
-  if (!roots.some((root) => isPathWithin(real, root))) {
-    throw new Error(`Refusing to read file outside the allowed upload boundary: ${real}. ` + `Allowed roots: the workspace (${realpathOrSelf(process.cwd())}) and the OS temp dir (${realpathOrSelf(tmpdir2())}). ` + `To allow this file, move it into the workspace or set OPENCODE_BROWSER_UPLOAD_DIRS ` + `(colon-separated absolute directories).`);
+  if (!roots.some((root) => isPathWithin2(real, root))) {
+    throw new Error(`Refusing to read file outside the allowed upload boundary: ${real}. ` + `Allowed roots: the workspace (${realpathOrSelf(process.cwd())}) and the OS temp dir (${realpathOrSelf(tmpdir2())}). ` + `To allow this file, move it into the workspace or set OPENCODE_BROWSER_UPLOAD_DIRS ` + `(OS PATH-delimited absolute directories: ";" on Windows, ":" on macOS/Linux).`);
   }
   return real;
 }
@@ -13469,7 +13630,7 @@ function writeJsonLine2(socket, msg) {
 }
 function maybeStartBroker() {
   const brokerPath = join2(BASE_DIR2, "broker.cjs");
-  if (!existsSync(brokerPath))
+  if (!existsSync2(brokerPath))
     return;
   try {
     const child = spawn2(process.execPath, [brokerPath], { detached: true, stdio: "ignore" });
@@ -13493,6 +13654,7 @@ async function sleep2(ms) {
 var BACKEND_MODE = (process.env.OPENCODE_BROWSER_BACKEND ?? process.env.OPENCODE_BROWSER_MODE ?? "extension").toLowerCase().trim();
 var USE_AGENT_BACKEND = ["agent", "agent-browser", "agentbrowser"].includes(BACKEND_MODE);
 var socket = null;
+var connectingPromise = null;
 var lastBrokerError = null;
 var sessionId = Math.random().toString(36).slice(2);
 var reqId = 0;
@@ -13501,52 +13663,81 @@ var agentBackend = USE_AGENT_BACKEND ? createAgentBackend(sessionId) : null;
 async function ensureBrokerSocket() {
   if (socket && !socket.destroyed)
     return socket;
-  try {
-    socket = await connectToBroker();
-  } catch {
-    maybeStartBroker();
-    for (let i = 0;i < 20; i++) {
-      await sleep2(100);
-      try {
-        socket = await connectToBroker();
-        break;
-      } catch {}
+  if (connectingPromise)
+    return await connectingPromise;
+  connectingPromise = (async () => {
+    let connectedSocket = null;
+    try {
+      connectedSocket = await connectToBroker();
+    } catch {
+      maybeStartBroker();
+      for (let i = 0;i < 20; i++) {
+        await sleep2(100);
+        try {
+          connectedSocket = await connectToBroker();
+          break;
+        } catch {}
+      }
     }
+    if (!connectedSocket || connectedSocket.destroyed) {
+      const errorMessage = lastBrokerError?.message ? ` (${lastBrokerError.message})` : "";
+      throw new Error(`Could not connect to local broker at ${SOCKET_PATH}${errorMessage}. ` + "Run `npx @ageless-h/opencode-browser install` and ensure the extension is loaded.");
+    }
+    socket = connectedSocket;
+    connectedSocket.setNoDelay(true);
+    logDebug(`broker connected socket=${SOCKET_PATH}`);
+    connectedSocket.on("data", createJsonLineParser2((msg) => {
+      if (msg?.type !== "response" || typeof msg.id !== "number")
+        return;
+      const p = pending.get(msg.id);
+      if (!p || p.socket !== connectedSocket)
+        return;
+      pending.delete(msg.id);
+      const res = msg;
+      if (!res.ok)
+        p.reject(new Error(res.error));
+      else
+        p.resolve(res.data);
+    }));
+    const rejectSocketPending = (reason) => {
+      for (const [id, p] of pending.entries()) {
+        if (p.socket !== connectedSocket)
+          continue;
+        pending.delete(id);
+        p.reject(new Error(reason));
+      }
+    };
+    connectedSocket.on("close", () => {
+      rejectSocketPending("Broker connection closed");
+      if (socket === connectedSocket)
+        socket = null;
+    });
+    connectedSocket.on("error", (err) => {
+      rejectSocketPending(`Broker connection error: ${err.message}`);
+      if (socket === connectedSocket)
+        socket = null;
+    });
+    writeJsonLine2(connectedSocket, { type: "hello", role: "plugin", sessionId, pid: process.pid });
+    return connectedSocket;
+  })();
+  try {
+    return await connectingPromise;
+  } finally {
+    connectingPromise = null;
   }
-  if (!socket || socket.destroyed) {
-    const errorMessage = lastBrokerError?.message ? ` (${lastBrokerError.message})` : "";
-    throw new Error(`Could not connect to local broker at ${SOCKET_PATH}${errorMessage}. ` + "Run `npx @ageless-h/opencode-browser install` and ensure the extension is loaded.");
-  }
-  socket.setNoDelay(true);
-  logDebug(`broker connected socket=${SOCKET_PATH}`);
-  socket.on("data", createJsonLineParser2((msg) => {
-    if (msg?.type !== "response" || typeof msg.id !== "number")
-      return;
-    const p = pending.get(msg.id);
-    if (!p)
-      return;
-    pending.delete(msg.id);
-    const res = msg;
-    if (!res.ok)
-      p.reject(new Error(res.error));
-    else
-      p.resolve(res.data);
-  }));
-  socket.on("close", () => {
-    socket = null;
-  });
-  socket.on("error", () => {
-    socket = null;
-  });
-  writeJsonLine2(socket, { type: "hello", role: "plugin", sessionId, pid: process.pid });
-  return socket;
 }
 async function brokerRequest(op, payload) {
   const s = await ensureBrokerSocket();
   const id = ++reqId;
   return await new Promise((resolve3, reject) => {
-    pending.set(id, { resolve: resolve3, reject });
-    writeJsonLine2(s, { type: "request", id, op, ...payload });
+    pending.set(id, { socket: s, resolve: resolve3, reject });
+    try {
+      writeJsonLine2(s, { type: "request", id, op, ...payload });
+    } catch (err) {
+      pending.delete(id);
+      reject(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
     setTimeout(() => {
       if (!pending.has(id))
         return;
@@ -14552,7 +14743,7 @@ var plugin = async (ctx) => {
         }
       }),
       browser_set_file_input: tool({
-        description: "HIGH SENSITIVITY: reads a local file and uploads it into a web page. " + "Set a file input's selected file via local path. selector supports locators (uid:/…); " + "omit index for strict unique match. " + "File reads are restricted: by default only files under the current workspace " + "(process.cwd()) and the OS temp dir are allowed; extra roots can be added via the " + "OPENCODE_BROWSER_UPLOAD_DIRS env var (colon-separated absolute dirs). Credential " + "locations (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/opencode, ~/.opencode-browser, " + "~/Library/Keychains), .env files, and key files (id_rsa, id_ed25519, *.pem, *.key) " + "are always refused. Only upload files the user explicitly asked to upload.",
+        description: "HIGH SENSITIVITY: reads a local file and uploads it into a web page. " + "Set a file input's selected file via local path. selector supports locators (uid:/…); " + "omit index for strict unique match. " + "File reads are restricted: by default only files under the current workspace " + "(process.cwd()) and the OS temp dir are allowed; extra roots can be added via the " + "OPENCODE_BROWSER_UPLOAD_DIRS env var (OS PATH-delimited absolute dirs: ';' on Windows, " + "':' on macOS/Linux). Credential " + "locations (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/opencode, ~/.opencode-browser, " + "~/Library/Keychains), .env files, and key files (id_rsa, id_ed25519, *.pem, *.key) " + "are always refused. Only upload files the user explicitly asked to upload.",
         args: {
           selector: schema.string(),
           filePath: schema.string(),

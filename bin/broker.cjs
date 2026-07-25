@@ -87,6 +87,7 @@ let nextExtId = 0;
 const extPending = new Map(); // extId -> { pluginSocket, pluginRequestId, sessionId }
 
 const clients = new Set();
+const sessionClients = new Map();
 
 // Tab ownership: tabId -> { sessionId, claimedAt, lastSeenAt, origin, mark }
 const claims = new Map();
@@ -224,6 +225,29 @@ function releaseClaimsForSession(sessionId) {
   }
   clearDefaultTab(sessionId);
   sessionState.delete(sessionId);
+}
+
+function unregisterSessionClient(client) {
+  if (client.role !== "plugin" || !client.sessionId) return false;
+  const set = sessionClients.get(client.sessionId);
+  if (!set) return true;
+  set.delete(client);
+  if (set.size) return false;
+  sessionClients.delete(client.sessionId);
+  return true;
+}
+
+function registerSessionClient(client, role, sessionId) {
+  unregisterSessionClient(client);
+  client.role = role || "unknown";
+  client.sessionId = sessionId || null;
+  if (client.role !== "plugin" || !client.sessionId) return;
+  let set = sessionClients.get(client.sessionId);
+  if (!set) {
+    set = new Set();
+    sessionClients.set(client.sessionId, set);
+  }
+  set.add(client);
 }
 
 function checkClaim(tabId, sessionId) {
@@ -582,8 +606,7 @@ async function handleTool(pluginSocket, req) {
 
 function handleClientMessage(socket, client, msg) {
   if (msg && msg.type === "hello") {
-    client.role = msg.role || "unknown";
-    client.sessionId = msg.sessionId;
+    registerSessionClient(client, msg.role, msg.sessionId);
     if (client.sessionId) touchSession(client.sessionId);
     if (client.role === "native-host") {
       host = { socket };
@@ -815,7 +838,11 @@ function start() {
             pending.reject(new Error("Native host disconnected"));
           }
         }
-        if (client.sessionId) releaseClaimsForSession(client.sessionId);
+        const disconnectedSessionId = client.sessionId;
+        const wasLastSessionClient = unregisterSessionClient(client);
+        if (disconnectedSessionId && wasLastSessionClient) {
+          releaseClaimsForSession(disconnectedSessionId);
+        }
       });
 
       socket.on("error", () => {
