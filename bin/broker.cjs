@@ -631,6 +631,19 @@ function handleClientMessage(socket, client, msg) {
         }
 
         if (msg.op === "tool") {
+          // Codex parity: a browser session gets its tab group eagerly — as soon as
+          // the agent starts using browser tools, not only on the first tab-mutating
+          // call. Pure diagnostics (status/capabilities) do not create a group.
+          if (sessionId && !["capabilities_list"].includes(msg.tool)) {
+            const state = getSessionState(sessionId);
+            if (state && !Number.isFinite(state.groupId)) {
+              try {
+                await ensureSessionGroup(sessionId);
+              } catch {
+                // Group creation is best-effort; tool dispatch must not fail on it.
+              }
+            }
+          }
           const result = await handleTool(socket, { tool: msg.tool, args: msg.args || {}, sessionId });
           replyOk(result);
           return;
