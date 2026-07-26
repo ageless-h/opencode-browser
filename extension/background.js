@@ -1047,6 +1047,22 @@ async function pageOps(command, args) {
     return resolveMatches(selectors, hasIndex ? index : undefined, timeoutMs, pollMs, !hasIndex)
   }
 
+  // requestAnimationFrame never fires in hidden/background tabs — an unbounded
+  // rAF wait would hang the action until the broker timeout (issue #37). Race
+  // the frame against a timer and degrade to a short delay when hidden.
+  function nextFrameBounded(timeoutMs = 500) {
+    if (document.visibilityState === "hidden") {
+      return new Promise((resolve) => setTimeout(resolve, 32))
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs)
+      requestAnimationFrame(() => {
+        clearTimeout(timer)
+        resolve()
+      })
+    })
+  }
+
   function clickElement(el) {
     try {
       el.scrollIntoView({ block: "center", inline: "center" })
@@ -1175,9 +1191,8 @@ async function pageOps(command, args) {
       return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
     }
     scrollElementAndFrames(match.chosen)
-    await new Promise((resolve) =>
-      requestAnimationFrame(() => requestAnimationFrame(resolve))
-    )
+    await nextFrameBounded()
+    await nextFrameBounded()
     const first = actionPointForElement(match.chosen)
     if (!first.ok) {
       return {
@@ -1186,7 +1201,7 @@ async function pageOps(command, args) {
         uid: match.chosen.getAttribute?.("data-opc-uid") || null,
       }
     }
-    await new Promise((resolve) => requestAnimationFrame(resolve))
+    await nextFrameBounded()
     const second = actionPointForElement(match.chosen)
     if (!second.ok) {
       return {
