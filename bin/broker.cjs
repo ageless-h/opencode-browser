@@ -157,6 +157,14 @@ function touchSession(sessionId) {
   const state = getSessionState(sessionId);
   if (!state) return null;
   state.lastSeenAt = nowMs();
+  // Keep the group seed's claim alive while the session is active. The seed tab is
+  // never used by tool calls, so without renewal its claim expires mid-session, the
+  // session state gets swept, and the next tool call creates a fresh orphan group
+  // (leaked blank tab groups in Chrome).
+  if (Number.isFinite(state.seedTabId)) {
+    const seedClaim = claims.get(state.seedTabId);
+    if (seedClaim && seedClaim.sessionId === sessionId) seedClaim.lastSeenAt = state.lastSeenAt;
+  }
   return state;
 }
 
@@ -224,7 +232,11 @@ function releaseClaimsForSession(sessionId) {
     if (info.sessionId === sessionId) claims.delete(tabId);
   }
   clearDefaultTab(sessionId);
-  sessionState.delete(sessionId);
+  // Keep sessionState (name/groupId/seedTabId) across disconnects: short-lived
+  // clients that connect per call must reconnect into the SAME session group
+  // instead of creating a new one every call. Idle sessions are reaped by
+  // cleanupStaleClaims(), which also closes the group seed tab — deleting the
+  // state here would orphan the seed's blank group in Chrome immediately.
 }
 
 function unregisterSessionClient(client) {
@@ -309,17 +321,37 @@ async function ensureSessionGroup(sessionId) {
   return { groupId: state.groupId, title: state.name, seedTabId, raw: content };
 }
 
+/** Best-effort close of an about:blank group seed so its scaffolding group disappears. */
+function closeSeedTabBestEffort(sessionId, seedId) {
+  callExtension("close_tab", { tabId: seedId }, sessionId).catch(() => {
+    // seed may already be gone, or the host is offline
+  });
+}
+
 function cleanupStaleClaims() {
   if (!LEASE_TTL_MS) return;
   const now = nowMs();
   for (const [tabId, info] of claims.entries()) {
     if (now - info.lastSeenAt > LEASE_TTL_MS) {
       releaseClaim(tabId);
+      // If this was a session's group seed, close the about:blank tab so the
+      // now-forgotten scaffolding group does not leak in Chrome.
+      const seedState = sessionState.get(info.sessionId);
+      if (seedState && seedState.seedTabId === tabId) {
+        seedState.seedTabId = null;
+        closeSeedTabBestEffort(info.sessionId, tabId);
+      }
     }
   }
   for (const [sessionId, state] of sessionState.entries()) {
     if (!sessionHasClaims(sessionId) && now - state.lastSeenAt > LEASE_TTL_MS) {
       sessionState.delete(sessionId);
+      // Session forgotten: close any remaining group seed so its group cannot
+      // become an unnamed orphan.
+      if (Number.isFinite(state.seedTabId)) {
+        closeSeedTabBestEffort(sessionId, state.seedTabId);
+        state.seedTabId = null;
+      }
     }
   }
 }
