@@ -2254,12 +2254,58 @@ async function pageOps(command, args) {
         for (const el of fields) {
           if (!isSensitiveField(el)) continue
           if (el.tagName === "SELECT") {
-            // value attribute not applicable to select — remove entirely.
-            el.removeAttribute("value")
+            el.setAttribute("value", "[REDACTED]")
+            for (const option of el.querySelectorAll("option")) {
+              option.setAttribute("value", "[REDACTED]")
+              option.textContent = "[REDACTED]"
+            }
             continue
           }
           el.setAttribute("value", "[REDACTED]")
           if (el.tagName === "TEXTAREA") el.textContent = "[REDACTED]"
+        }
+
+        for (const meta of clone.querySelectorAll("meta")) {
+          const descriptor = [
+            meta.getAttribute("name"),
+            meta.getAttribute("property"),
+            meta.getAttribute("itemprop"),
+            meta.getAttribute("http-equiv"),
+          ]
+            .filter(Boolean)
+            .join(" ")
+          if (SENSITIVE_NAME_RE.test(descriptor)) {
+            meta.setAttribute("content", "[REDACTED]")
+          }
+        }
+
+        const redactJsonValue = (value) => {
+          if (Array.isArray(value)) return value.map(redactJsonValue)
+          if (!value || typeof value !== "object") return value
+          const redacted = {}
+          for (const [key, item] of Object.entries(value)) {
+            redacted[key] = SENSITIVE_NAME_RE.test(key) ? "[REDACTED]" : redactJsonValue(item)
+          }
+          return redacted
+        }
+
+        for (const script of clone.querySelectorAll("script:not([src])")) {
+          const source = script.textContent || ""
+          if (!SENSITIVE_NAME_RE.test(source)) continue
+          const type = String(script.getAttribute("type") || "").toLowerCase()
+          const looksLikeJson =
+            type === "application/json" ||
+            type === "application/ld+json" ||
+            /^[\s]*[\[{]/.test(source)
+          if (looksLikeJson) {
+            try {
+              script.textContent = JSON.stringify(redactJsonValue(JSON.parse(source)))
+              continue
+            } catch {}
+          }
+          // Inline assignment/state scripts are not safe to partially rewrite:
+          // redact the whole payload if it contains a sensitive key marker.
+          script.textContent = "[REDACTED]"
         }
         html = clone.outerHTML
       }

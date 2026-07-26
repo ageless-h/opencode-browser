@@ -71,12 +71,14 @@ Snapshot, `page_text`, visible-DOM, and export paths redact values of sensitive
 form fields by default: inputs of type `password` or `hidden`, fields with
 `autocomplete` values such as `current-password` / `new-password` /
 `one-time-code`, and fields whose name/id match patterns like `passw`, `pwd`,
-`token`, `secret`, `api-key`, `otp`, `csrf`, `session`.
+`token`, `secret`, `api-key`, `otp`, `csrf`, `session`. HTML export also
+redacts matching metadata, sensitive select options, and sensitive keys in
+inline JSON state.
 
 Limits: redaction is heuristic and only applies to structured extraction tools.
-`browser_evaluate` runs arbitrary JavaScript and is not redacted; screenshots
-capture whatever is visually on screen; visible (non-redacted) page text may
-still contain secrets displayed by the site.
+Explicit `browser_query` value/property reads and `browser_evaluate` are not
+redacted; screenshots capture whatever is visually on screen; visible
+(non-redacted) page text may still contain secrets displayed by the site.
 
 ## 4. User control
 

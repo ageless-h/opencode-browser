@@ -15,8 +15,21 @@ type AgentConnectionInfo =
   | { type: "tcp"; host: string; port: number };
 
 type PendingRequest = {
+  socket: net.Socket;
   resolve: (value: any) => void;
   reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+type AgentTabSnapshot = {
+  index: number;
+  url: string;
+  title: string;
+  active: boolean;
+};
+
+type StableAgentTab = AgentTabSnapshot & {
+  id: number;
 };
 
 const agentRequire = createRequire(import.meta.url);
@@ -375,17 +388,42 @@ function buildAgentPageTextScript(limit: number, pattern: string | null, flags: 
   return buildEvalScript(`
     const payload = ${JSON.stringify(payload)};
     const safeString = (value) => (typeof value === "string" ? value : "");
+    const sensitiveName = /passw|pwd|token|secret|api[-_]?key|otp|csrf|session/i;
+    const isSensitiveField = (element) => {
+      if (!element || !element.tagName) return false;
+      const type = safeString(element.getAttribute && element.getAttribute("type")).toLowerCase();
+      if (type === "password" || type === "hidden") return true;
+      const autocomplete = safeString(
+        element.getAttribute && element.getAttribute("autocomplete")
+      ).toLowerCase();
+      if (["current-password", "new-password", "one-time-code"].includes(autocomplete)) {
+        return true;
+      }
+      const nameId =
+        safeString(element.getAttribute && element.getAttribute("name")) +
+        " " +
+        safeString(element.id);
+      return sensitiveName.test(nameId);
+    };
     const bodyText = safeString(document.body ? document.body.innerText : "");
-    const inputText = Array.from(document.querySelectorAll("input, textarea, [contenteditable='true']"))
+    const inputText = Array.from(
+      document.querySelectorAll("input, textarea, select, [contenteditable='true']")
+    )
       .map((element) => {
-        if (element.tagName === "INPUT" || element.tagName === "TEXTAREA") {
+        if (
+          element.tagName === "INPUT" ||
+          element.tagName === "TEXTAREA" ||
+          element.tagName === "SELECT"
+        ) {
+          if (isSensitiveField(element)) return "[REDACTED]";
           return safeString(element.value);
         }
+        if (isSensitiveField(element)) return "[REDACTED]";
         return safeString(element.textContent);
       })
       .filter(Boolean)
-      .join("\n");
-    const combined = [bodyText, inputText].filter(Boolean).join("\n\n");
+      .join("\\n");
+    const combined = [bodyText, inputText].filter(Boolean).join("\\n\\n");
     const maxSize = Number.isFinite(payload.limit) ? payload.limit : ${DEFAULT_PAGE_TEXT_LIMIT};
     const text = combined.slice(0, Math.max(0, maxSize));
     let matches = [];
@@ -408,6 +446,86 @@ function buildAgentPageTextScript(limit: number, pattern: string | null, flags: 
       matches,
     };
   `);
+}
+
+function buildAgentSensitiveValuesScript(): string {
+  return buildEvalScript(`
+    const safeString = (value) => (typeof value === "string" ? value : "");
+    const sensitiveName = /passw|pwd|token|secret|api[-_]?key|otp|csrf|session/i;
+    const isSensitiveField = (element) => {
+      if (!element || !element.tagName) return false;
+      const type = safeString(element.getAttribute && element.getAttribute("type")).toLowerCase();
+      if (type === "password" || type === "hidden") return true;
+      const autocomplete = safeString(
+        element.getAttribute && element.getAttribute("autocomplete")
+      ).toLowerCase();
+      if (["current-password", "new-password", "one-time-code"].includes(autocomplete)) {
+        return true;
+      }
+      const nameId =
+        safeString(element.getAttribute && element.getAttribute("name")) +
+        " " +
+        safeString(element.id);
+      return sensitiveName.test(nameId);
+    };
+    const values = [];
+    for (const element of document.querySelectorAll("input, textarea, select")) {
+      if (!isSensitiveField(element)) continue;
+      const candidates = [
+        element.value,
+        element.getAttribute && element.getAttribute("value"),
+      ];
+      if (element.tagName === "TEXTAREA") candidates.push(element.textContent);
+      if (element.tagName === "SELECT") {
+        for (const option of element.options || []) {
+          if (option.selected) candidates.push(option.value, option.textContent);
+        }
+      }
+      for (const candidate of candidates) {
+        const value = safeString(candidate);
+        if (value) values.push(value);
+      }
+    }
+    return Array.from(new Set(values));
+  `);
+}
+
+function redactSensitiveValues(value: any, sensitiveValues: string[]): any {
+  const values = [...new Set(sensitiveValues.filter(Boolean))].sort(
+    (left, right) => right.length - left.length
+  );
+
+  if (typeof value === "string") {
+    let redacted = value;
+    for (const secret of values) {
+      if (secret.length < 3) {
+        if (redacted === secret) {
+          redacted = "[REDACTED]";
+          continue;
+        }
+        redacted = redacted
+          .split(`"${secret}"`)
+          .join('"[REDACTED]"')
+          .split(`'${secret}'`)
+          .join("'[REDACTED]'");
+        continue;
+      }
+      redacted = redacted.split(secret).join("[REDACTED]");
+    }
+    return redacted;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveValues(item, values));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        redactSensitiveValues(item, values),
+      ])
+    );
+  }
+  return value;
 }
 
 function buildAgentListScript(selector: string, limit: number): string {
@@ -525,7 +643,16 @@ function ensureEvalResult(result: any, fallback: string): any {
   return result.value;
 }
 
-export function createAgentBackend(sessionId: string): AgentBackend {
+export type AgentBackendOptions = {
+  // Test seam: replace the low-level connection factory. Production uses the
+  // real daemon transport derived from the connection info.
+  connect?: () => Promise<net.Socket>;
+};
+
+export function createAgentBackend(
+  sessionId: string,
+  options: AgentBackendOptions = {}
+): AgentBackend {
   const session = getAgentSession(sessionId);
   const connection = getAgentConnectionInfo(session);
 
@@ -549,10 +676,16 @@ export function createAgentBackend(sessionId: string): AgentBackend {
   }
 
   let agentSocket: net.Socket | null = null;
+  let agentConnecting: Promise<net.Socket> | null = null;
   let agentReqId = 0;
   const agentPending = new Map<string, PendingRequest>();
+  let tabOperationTail = Promise.resolve();
+  let tabRegistryInitialized = false;
+  let nextStableTabId = 0;
+  const stableTabs = new Map<number, StableAgentTab>();
 
   async function connectToAgent(): Promise<net.Socket> {
+    if (options.connect) return await options.connect();
     return await new Promise((resolve, reject) => {
       const socket =
         connection.type === "unix"
@@ -574,56 +707,90 @@ export function createAgentBackend(sessionId: string): AgentBackend {
     });
   }
 
-  async function ensureAgentSocket(): Promise<net.Socket> {
-    if (agentSocket && !agentSocket.destroyed) return agentSocket;
-
-    try {
-      agentSocket = await connectToAgent();
-    } catch {
-      await maybeStartAgentDaemon(connection, session);
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await sleep(100);
-        try {
-          agentSocket = await connectToAgent();
-          break;
-        } catch {}
-      }
+  function rejectSocketPending(socket: net.Socket, reason: string): void {
+    for (const [id, pending] of agentPending) {
+      if (pending.socket !== socket) continue;
+      agentPending.delete(id);
+      clearTimeout(pending.timer);
+      pending.reject(new Error(reason));
     }
+  }
 
-    if (!agentSocket || agentSocket.destroyed) {
-      const target =
-        connection.type === "unix" ? connection.path : `${connection.host}:${connection.port}`;
-      throw new Error(`Could not connect to agent-browser daemon at ${target}.`);
-    }
-
-    agentSocket.setNoDelay(true);
-    agentSocket.on(
+  function attachAgentSocket(socket: net.Socket): void {
+    socket.setNoDelay(true);
+    socket.on(
       "data",
       createJsonLineParser((msg) => {
         if (!msg || msg.id === undefined) return;
         const messageId = typeof msg.id === "string" ? msg.id : String(msg.id);
         const pending = agentPending.get(messageId);
-        if (!pending) return;
+        // Ignore responses that arrive on a stale socket generation.
+        if (!pending || pending.socket !== socket) return;
         agentPending.delete(messageId);
+        clearTimeout(pending.timer);
         const res = msg as AgentResponse;
         if (!res.success) pending.reject(new Error(res.error || "Agent browser error"));
         else pending.resolve(res.data);
       })
     );
 
-    agentSocket.on("close", () => {
-      for (const pending of agentPending.values()) {
-        pending.reject(new Error("Agent browser connection closed"));
+    // A close/error event belongs to exactly one socket generation: it must
+    // only reject that generation's pending requests and only clear the
+    // global reference if it still points at this socket (issue #36).
+    socket.on("close", () => {
+      rejectSocketPending(socket, "Agent browser connection closed");
+      if (agentSocket === socket) agentSocket = null;
+    });
+
+    socket.on("error", () => {
+      rejectSocketPending(socket, "Agent browser connection error");
+      if (agentSocket === socket) agentSocket = null;
+    });
+  }
+
+  async function openAgentSocket(): Promise<net.Socket> {
+    let socket: net.Socket | null = null;
+    try {
+      socket = await connectToAgent();
+    } catch (firstError) {
+      if (options.connect) throw firstError;
+      await maybeStartAgentDaemon(connection, session);
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await sleep(100);
+        try {
+          socket = await connectToAgent();
+          break;
+        } catch {}
       }
-      agentPending.clear();
-      agentSocket = null;
-    });
+    }
 
-    agentSocket.on("error", () => {
-      agentSocket = null;
-    });
+    if (!socket || socket.destroyed) {
+      const target =
+        connection.type === "unix" ? connection.path : `${connection.host}:${connection.port}`;
+      throw new Error(`Could not connect to agent-browser daemon at ${target}.`);
+    }
 
-    return agentSocket;
+    attachAgentSocket(socket);
+    return socket;
+  }
+
+  async function ensureAgentSocket(): Promise<net.Socket> {
+    if (agentSocket && !agentSocket.destroyed) return agentSocket;
+
+    // Single-flight: concurrent first-connect/reconnect callers share one
+    // connection attempt instead of racing to overwrite the global socket
+    // (issue #36).
+    if (!agentConnecting) {
+      agentConnecting = openAgentSocket()
+        .then((socket) => {
+          agentSocket = socket;
+          return socket;
+        })
+        .finally(() => {
+          agentConnecting = null;
+        });
+    }
+    return await agentConnecting;
   }
 
   async function agentRequest(action: string, payload: Record<string, any>): Promise<any> {
@@ -631,13 +798,13 @@ export function createAgentBackend(sessionId: string): AgentBackend {
     const id = `a${++agentReqId}`;
 
     return await new Promise((resolve, reject) => {
-      agentPending.set(id, { resolve, reject });
-      writeJsonLine(socket, { id, action, ...payload });
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (!agentPending.has(id)) return;
         agentPending.delete(id);
         reject(new Error("Timed out waiting for agent-browser response"));
       }, REQUEST_TIMEOUT_MS);
+      agentPending.set(id, { socket, resolve, reject, timer });
+      writeJsonLine(socket, { id, action, ...payload });
     });
   }
 
@@ -645,10 +812,128 @@ export function createAgentBackend(sessionId: string): AgentBackend {
     return await agentRequest(action, payload);
   }
 
+  async function withTabOperationLock<T>(action: () => Promise<T>): Promise<T> {
+    const previous = tabOperationTail;
+    let release: () => void = () => {};
+    tabOperationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release();
+    }
+  }
+
+  function normalizeAgentTabs(data: any): AgentTabSnapshot[] {
+    const tabs = Array.isArray(data?.tabs) ? data.tabs : [];
+    return tabs
+      .filter((tab: any) => Number.isFinite(tab?.index))
+      .map((tab: any) => ({
+        index: Number(tab.index),
+        url: typeof tab.url === "string" ? tab.url : "",
+        title: typeof tab.title === "string" ? tab.title : "",
+        active: tab.active === true,
+      }))
+      .sort((left: AgentTabSnapshot, right: AgentTabSnapshot) => left.index - right.index);
+  }
+
+  function tabFingerprint(tab: Pick<AgentTabSnapshot, "url" | "title">): string {
+    return `${tab.url}\u0000${tab.title}`;
+  }
+
+  function allocateStableTabId(preferred?: number): number {
+    if (Number.isFinite(preferred) && !stableTabs.has(Number(preferred))) {
+      const id = Number(preferred);
+      nextStableTabId = Math.max(nextStableTabId, id + 1);
+      return id;
+    }
+    while (stableTabs.has(nextStableTabId)) nextStableTabId++;
+    return nextStableTabId++;
+  }
+
+  function initializeTabRegistry(tabs: AgentTabSnapshot[]): void {
+    stableTabs.clear();
+    for (const tab of tabs) {
+      const id = allocateStableTabId(tab.index);
+      stableTabs.set(id, { id, ...tab });
+    }
+    tabRegistryInitialized = true;
+  }
+
+  function reconcileUnexpectedTabChange(tabs: AgentTabSnapshot[]): void {
+    const previous = [...stableTabs.values()];
+    const usedIds = new Set<number>();
+    const nextRecords: StableAgentTab[] = [];
+
+    for (const tab of tabs) {
+      const fingerprint = tabFingerprint(tab);
+      const candidates = previous.filter(
+        (record) => !usedIds.has(record.id) && tabFingerprint(record) === fingerprint
+      );
+      if (candidates.length === 1) {
+        const record = candidates[0];
+        usedIds.add(record.id);
+        nextRecords.push({ id: record.id, ...tab });
+      }
+    }
+
+    for (const tab of tabs) {
+      if (nextRecords.some((record) => record.index === tab.index)) continue;
+      const id = allocateStableTabId();
+      nextRecords.push({ id, ...tab });
+    }
+
+    stableTabs.clear();
+    for (const record of nextRecords) stableTabs.set(record.id, record);
+  }
+
+  async function refreshTabRegistry(): Promise<{
+    tabs: AgentTabSnapshot[];
+    active: number | null;
+  }> {
+    const data = await agentCommand("tab_list", {});
+    const tabs = normalizeAgentTabs(data);
+    if (!tabRegistryInitialized) {
+      initializeTabRegistry(tabs);
+    } else if (tabs.length === stableTabs.size) {
+      const byIndex = new Map(tabs.map((tab) => [tab.index, tab]));
+      for (const record of stableTabs.values()) {
+        const current = byIndex.get(record.index);
+        if (current) Object.assign(record, current);
+      }
+    } else {
+      // Out-of-band tab creation/closure cannot be identified perfectly by
+      // agent-browser 0.4.x. Preserve only uniquely matching fingerprints;
+      // ambiguous pages receive fresh ids so stale ids fail closed.
+      reconcileUnexpectedTabChange(tabs);
+    }
+    return {
+      tabs,
+      active: Number.isFinite(data?.active) ? Number(data.active) : null,
+    };
+  }
+
+  function recordForUpstreamIndex(index: number): StableAgentTab | undefined {
+    return [...stableTabs.values()].find((record) => record.index === index);
+  }
+
+  async function resolveStableTab(tabId: number): Promise<StableAgentTab> {
+    await refreshTabRegistry();
+    const record = stableTabs.get(tabId);
+    if (!record) throw new Error(`Unknown or closed tabId: ${tabId}`);
+    return record;
+  }
+
   async function withTab<T>(tabId: number | undefined, action: () => Promise<T>): Promise<T> {
-    if (!Number.isFinite(tabId)) return await action();
-    await agentCommand("tab_switch", { index: tabId });
-    return await action();
+    return await withTabOperationLock(async () => {
+      if (Number.isFinite(tabId)) {
+        const record = await resolveStableTab(Number(tabId));
+        await agentCommand("tab_switch", { index: record.index });
+      }
+      return await action();
+    });
   }
 
   async function agentEvaluate(script: string): Promise<any> {
@@ -775,16 +1060,20 @@ export function createAgentBackend(sessionId: string): AgentBackend {
   async function requestTool(tool: string, args: Record<string, any>): Promise<any> {
     switch (tool) {
       case "get_tabs": {
-        const data = await agentCommand("tab_list", {});
-        const tabs = Array.isArray(data?.tabs) ? data.tabs : [];
-        const mapped = tabs.map((tab: any) => ({
-          id: tab.index,
-          url: tab.url,
-          title: tab.title,
-          active: tab.active,
-          windowId: tab.windowId ?? 0,
-        }));
-        return { content: JSON.stringify(mapped, null, 2) };
+        return await withTabOperationLock(async () => {
+          const { tabs } = await refreshTabRegistry();
+          const mapped = tabs.map((tab) => {
+            const record = recordForUpstreamIndex(tab.index);
+            return {
+              id: record?.id,
+              url: tab.url,
+              title: tab.title,
+              active: tab.active,
+              windowId: 0,
+            };
+          });
+          return { content: JSON.stringify(mapped, null, 2) };
+        });
       }
       case "list_downloads": {
         return { content: JSON.stringify({ downloads }, null, 2) };
@@ -876,21 +1165,31 @@ export function createAgentBackend(sessionId: string): AgentBackend {
         };
       }
       case "open_tab": {
-        // Default non-stealing: active false unless explicitly true.
-        const active = args.active === true;
-        let previousActive: number | null = null;
-        if (!active) {
-          const list = await agentCommand("tab_list", {});
-          if (Number.isFinite(list?.active)) previousActive = list.active;
-        }
-        const created = await agentCommand("tab_new", {});
-        if (args.url) {
-          await agentCommand("navigate", { url: args.url });
-        }
-        if (!active && previousActive !== null) {
-          await agentCommand("tab_switch", { index: previousActive });
-        }
-        return { content: { tabId: created.index, url: args.url, active } };
+        return await withTabOperationLock(async () => {
+          // Default non-stealing: active false unless explicitly true.
+          const active = args.active === true;
+          const registry = await refreshTabRegistry();
+          const previousActive = active ? null : registry.active;
+          const created = await agentCommand("tab_new", {});
+          if (!Number.isFinite(created?.index)) {
+            throw new Error("agent-browser did not return the new tab index");
+          }
+          const stableId = allocateStableTabId();
+          stableTabs.set(stableId, {
+            id: stableId,
+            index: Number(created.index),
+            url: typeof args.url === "string" ? args.url : "about:blank",
+            title: "",
+            active,
+          });
+          if (args.url) {
+            await agentCommand("navigate", { url: args.url });
+          }
+          if (!active && previousActive !== null) {
+            await agentCommand("tab_switch", { index: previousActive });
+          }
+          return { content: { tabId: stableId, url: args.url, active } };
+        });
       }
       case "name_session": {
         return {
@@ -923,11 +1222,29 @@ export function createAgentBackend(sessionId: string): AgentBackend {
         };
       }
       case "close_tab": {
-        const payload: Record<string, any> = {};
-        if (Number.isFinite(args.tabId)) payload.index = args.tabId;
-        const result = await agentCommand("tab_close", payload);
-        const closed = Number.isFinite(result?.closed) ? result.closed : args.tabId;
-        return { content: { tabId: closed, remaining: result?.remaining } };
+        return await withTabOperationLock(async () => {
+          const registry = await refreshTabRegistry();
+          let record: StableAgentTab | undefined;
+          if (Number.isFinite(args.tabId)) {
+            record = stableTabs.get(Number(args.tabId));
+            if (!record) throw new Error(`Unknown or closed tabId: ${args.tabId}`);
+          } else if (registry.active !== null) {
+            record = recordForUpstreamIndex(registry.active);
+          }
+          if (!record) throw new Error("Could not resolve the tab to close");
+
+          const result = await agentCommand("tab_close", { index: record.index });
+          stableTabs.delete(record.id);
+          for (const remaining of stableTabs.values()) {
+            if (remaining.index > record.index) remaining.index--;
+          }
+          return {
+            content: {
+              tabId: record.id,
+              remaining: result?.remaining,
+            },
+          };
+        });
       }
       case "navigate": {
         return await withTab(args.tabId, async () => {
@@ -962,10 +1279,13 @@ export function createAgentBackend(sessionId: string): AgentBackend {
       }
       case "set_active_tab": {
         if (!Number.isFinite(args.tabId)) throw new Error("tabId is required");
-        await agentCommand("tab_switch", { index: args.tabId });
-        return {
-          content: JSON.stringify({ ok: true, tabId: args.tabId, active: true }),
-        };
+        return await withTabOperationLock(async () => {
+          const record = await resolveStableTab(Number(args.tabId));
+          await agentCommand("tab_switch", { index: record.index });
+          return {
+            content: JSON.stringify({ ok: true, tabId: record.id, active: true }),
+          };
+        });
       }
       case "key": {
         return await withTab(args.tabId, async () => {
@@ -1186,9 +1506,16 @@ export function createAgentBackend(sessionId: string): AgentBackend {
       case "snapshot": {
         return await withTab(args.tabId, async () => {
           const data = await agentCommand("snapshot", {});
+          const sensitiveValues = await agentEvaluate(buildAgentSensitiveValuesScript());
+          if (!Array.isArray(sensitiveValues)) {
+            throw new Error("Could not safely redact agent-browser snapshot values");
+          }
+          const values = sensitiveValues.filter(
+            (value): value is string => typeof value === "string"
+          );
           const payload = {
-            snapshot: data?.snapshot ?? "",
-            refs: data?.refs ?? {},
+            snapshot: redactSensitiveValues(data?.snapshot ?? "", values),
+            refs: redactSensitiveValues(data?.refs ?? {}, values),
           };
           return { content: JSON.stringify(payload, null, 2) };
         });

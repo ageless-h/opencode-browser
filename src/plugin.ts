@@ -1025,7 +1025,7 @@ const plugin: Plugin = async (ctx) => {
 
       browser_export: tool({
         description:
-          'Export page content (Codex Tab.content.export). contentType: "html" | "text" | "domSnapshot".',
+          'Export page content (Codex Tab.content.export). contentType: "html" | "text" | "domSnapshot". HTML export redacts sensitive form, metadata, and inline state values.',
         args: {
           contentType: schema.string().optional(),
           tabId: schema.number().optional(),
@@ -1372,7 +1372,7 @@ const plugin: Plugin = async (ctx) => {
 
       browser_query: tool({
         description:
-          "Read data from the page using selectors, optional wait, or page_text extraction (shadow DOM + same-origin iframes).",
+          "Read data from the page using selectors, optional wait, or page_text extraction (shadow DOM + same-origin iframes). Broad page_text extraction redacts sensitive form values; explicit value/property reads can return them.",
         args: {
           selector: schema.string().optional(),
           mode: schema.string().optional(),

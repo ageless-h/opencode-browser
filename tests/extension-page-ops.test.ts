@@ -1,7 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { EventEmitter } from "events";
 import { existsSync, readFileSync } from "fs";
+import type { Socket } from "net";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { join } from "path";
+import { createAgentBackend } from "../src/agent-backend";
 
 const sourcePath = join(import.meta.dir, "..", "extension", "background.js");
 const source = readFileSync(sourcePath, "utf8");
@@ -23,6 +26,68 @@ const executablePath = chromeCandidates.find((candidate) => existsSync(candidate
 
 let browser: Browser;
 let page: Page;
+
+class PageAgentSocket extends EventEmitter {
+  destroyed = false;
+  private readonly page: Page;
+  private readonly failEvaluate: boolean;
+
+  constructor(pageValue: Page, failEvaluate = false) {
+    super();
+    this.page = pageValue;
+    this.failEvaluate = failEvaluate;
+  }
+
+  setNoDelay(): void {}
+
+  write(data: string): boolean {
+    for (const line of data.split("\n").filter((value) => value.trim())) {
+      const message = JSON.parse(line);
+      void this.respondTo(message);
+    }
+    return true;
+  }
+
+  private async respondTo(message: any): Promise<void> {
+    let data: any = {};
+    if (message.action === "evaluate") {
+      if (this.failEvaluate) {
+        this.emit(
+          "data",
+          Buffer.from(
+            JSON.stringify({
+              id: message.id,
+              success: false,
+              error: "evaluate unavailable",
+            }) + "\n"
+          )
+        );
+        return;
+      }
+      const result = await this.page.evaluate((script) => (0, eval)(script), message.script);
+      data = { result };
+    } else if (message.action === "snapshot") {
+      data = {
+        snapshot: [
+          '- textbox "Password" value="super-secret-password"',
+          '- textbox "PIN" value="q7"',
+          '- textbox "API key" value="secret-api-key"',
+          '- textbox "Display name" value="safe-name"',
+        ].join("\n"),
+        refs: {
+          e1: { role: "textbox", value: "super-secret-password" },
+          e2: { role: "textbox", value: "q7" },
+          e3: { role: "textbox", value: "secret-api-key" },
+          e4: { role: "textbox", value: "safe-name" },
+        },
+      };
+    }
+    this.emit(
+      "data",
+      Buffer.from(JSON.stringify({ id: message.id, success: true, data }) + "\n")
+    );
+  }
+}
 
 async function runPageOp(command: string, args: Record<string, unknown> = {}) {
   return await page.evaluate(
@@ -75,6 +140,7 @@ describe("extension page operation regressions", () => {
   test("redacts sensitive fields from page text and HTML export", async () => {
     await page.setContent(`
       <input type="password" value="super-secret-password">
+      <input type="password" value="q7">
       <input type="hidden" name="csrf_token" value="secret-token">
       <input name="api_key" value="secret-api-key">
       <input name="display_name" value="safe-name">
@@ -86,10 +152,69 @@ describe("extension page operation regressions", () => {
     const snapshot = await runSnapshot();
     const combined = JSON.stringify({ pageText, visibleDom, exported, snapshot });
     expect(combined).not.toContain("super-secret-password");
+    expect(combined).not.toContain("q7");
     expect(combined).not.toContain("secret-token");
     expect(combined).not.toContain("secret-api-key");
     expect(combined).toContain("safe-name");
     expect(combined).toContain("[REDACTED]");
+  });
+
+  test("fails closed when an agent snapshot cannot inspect sensitive values", async () => {
+    const socket = new PageAgentSocket(page, true);
+    const backend = createAgentBackend("snapshot-redaction-failure-test", {
+      connect: async () => socket as unknown as Socket,
+    });
+
+    await expect(backend.requestTool("snapshot", {})).rejects.toThrow(
+      "evaluate unavailable"
+    );
+  });
+
+  test("redacts sensitive agent-backend page text and snapshot values", async () => {
+    await page.setContent(`
+      <input type="password" value="super-secret-password">
+      <input type="hidden" name="csrf_token" value="secret-token">
+      <input name="api_key" value="secret-api-key">
+      <input name="display_name" value="safe-name">
+    `);
+
+    const socket = new PageAgentSocket(page);
+    const backend = createAgentBackend("sensitive-export-test", {
+      connect: async () => socket as unknown as Socket,
+    });
+    const pageText = await backend.requestTool("query", { mode: "page_text" });
+    const snapshot = await backend.requestTool("snapshot", {});
+    const combined = JSON.stringify({ pageText, snapshot });
+
+    expect(combined).not.toContain("super-secret-password");
+    expect(combined).not.toContain("secret-token");
+    expect(combined).not.toContain("secret-api-key");
+    expect(combined).toContain("safe-name");
+    expect(combined).toContain("[REDACTED]");
+  });
+
+  test("redacts sensitive select, metadata, and inline state from HTML export", async () => {
+    await page.setContent(`
+      <meta name="csrf-token" content="meta-secret-token">
+      <select name="access_token">
+        <option value="select-secret-token" selected>select-secret-label</option>
+      </select>
+      <script type="application/json">
+        {"profile":{"name":"Alice"},"auth":{"access_token":"json-secret-token"}}
+      </script>
+      <script>window.__STATE__ = {"apiKey":"inline-secret-key"}</script>
+      <input name="display_name" value="safe-name">
+    `);
+
+    const exported = await runPageOp("export", { contentType: "html" });
+    expect(exported.value).not.toContain("meta-secret-token");
+    expect(exported.value).not.toContain("select-secret-token");
+    expect(exported.value).not.toContain("select-secret-label");
+    expect(exported.value).not.toContain("json-secret-token");
+    expect(exported.value).not.toContain("inline-secret-key");
+    expect(exported.value).toContain("safe-name");
+    expect(exported.value).toContain("Alice");
+    expect(exported.value).toContain("[REDACTED]");
   });
 
   test("fails closed for hidden and intercepted click targets", async () => {
