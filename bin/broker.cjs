@@ -138,13 +138,16 @@ function getSessionState(sessionId) {
   return state;
 }
 
-/** Close about:blank group seed once a real agent tab exists (Chrome needs a tab to create groups). */
-async function dropSeedTabIfReplaced(sessionId, keepTabId) {
+/** Close an about:blank group seed once a real tab replaces it. */
+async function dropSeedTabIfReplaced(sessionId, keepTabId, replacementIsGrouped = false) {
   const state = getSessionState(sessionId);
   if (!state || !Number.isFinite(state.seedTabId)) return;
   const seedId = state.seedTabId;
   if (seedId === keepTabId) return;
   state.seedTabId = null;
+  // Closing the only grouped tab destroys the Chrome group. Keep its id only
+  // when the replacement was explicitly opened inside that same group.
+  if (!replacementIsGrouped) state.groupId = null;
   try {
     await callExtension("close_tab", { tabId: seedId }, sessionId);
   } catch {
@@ -159,8 +162,8 @@ function touchSession(sessionId) {
   state.lastSeenAt = nowMs();
   // Keep the group seed's claim alive while the session is active. The seed tab is
   // never used by tool calls, so without renewal its claim expires mid-session, the
-  // session state gets swept, and the next tool call creates a fresh orphan group
-  // (leaked blank tab groups in Chrome).
+  // session state gets swept, and a later group-requiring call creates a fresh
+  // orphan group (leaked blank tab groups in Chrome).
   if (Number.isFinite(state.seedTabId)) {
     const seedClaim = claims.get(state.seedTabId);
     if (seedClaim && seedClaim.sessionId === sessionId) seedClaim.lastSeenAt = state.lastSeenAt;
@@ -399,7 +402,7 @@ async function ensureSessionTab(sessionId) {
   if (Number.isFinite(content.groupId)) state.groupId = content.groupId;
   setClaim(tabId, sessionId, { origin: "agent", mark: null });
   setDefaultTab(sessionId, tabId);
-  await dropSeedTabIfReplaced(sessionId, tabId);
+  await dropSeedTabIfReplaced(sessionId, tabId, true);
   return tabId;
 }
 
@@ -626,7 +629,7 @@ async function handleTool(pluginSocket, req) {
       const content = res && res.content != null ? res.content : {};
       const state = getSessionState(sessionId);
       if (state && Number.isFinite(content.groupId)) state.groupId = content.groupId;
-      await dropSeedTabIfReplaced(sessionId, usedTabId);
+      await dropSeedTabIfReplaced(sessionId, usedTabId, true);
     } else {
       touchClaim(usedTabId, sessionId);
       setDefaultTab(sessionId, usedTabId);
@@ -762,19 +765,6 @@ function handleClientMessage(socket, client, msg) {
         }
 
         if (msg.op === "tool") {
-          // Codex parity: a browser session gets its tab group eagerly — as soon as
-          // the agent starts using browser tools, not only on the first tab-mutating
-          // call. Pure diagnostics (status/capabilities) do not create a group.
-          if (sessionId && !["capabilities_list"].includes(msg.tool)) {
-            const state = getSessionState(sessionId);
-            if (state && !Number.isFinite(state.groupId)) {
-              try {
-                await ensureSessionGroup(sessionId);
-              } catch {
-                // Group creation is best-effort; tool dispatch must not fail on it.
-              }
-            }
-          }
           const result = await handleTool(socket, { tool: msg.tool, args: msg.args || {}, sessionId });
           replyOk(result);
           return;

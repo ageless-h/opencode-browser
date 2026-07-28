@@ -161,22 +161,18 @@ test("broker drops a group seed when claim_tab replaces it with a real tab", asy
     JSON.stringify({ type: "hello", role: "plugin", sessionId: "claim-session" }) + "\n"
   );
 
-  const getTabsResponse = request(plugin, {
+  const nameSessionResponse = request(plugin, {
     type: "request",
     id: 1,
-    op: "tool",
-    tool: "get_tabs",
-    args: {},
+    op: "name_session",
+    name: "Claim session",
   });
   const nameSessionRequest = await readLine(host);
   expect(nameSessionRequest.message.tool).toBe("name_session");
   sendExtensionResult(host, nameSessionRequest, {
     content: { groupId: 7, seedTabId: 99 },
   });
-  const getTabsRequest = await readLine(host);
-  expect(getTabsRequest.message.tool).toBe("get_tabs");
-  sendExtensionResult(host, getTabsRequest, { content: { tabs: [] } });
-  expect((await getTabsResponse).ok).toBeTrue();
+  expect((await nameSessionResponse).ok).toBeTrue();
 
   const claimResponse = request(plugin, {
     type: "request",
@@ -200,11 +196,17 @@ test("broker drops a group seed when claim_tab replaces it with a real tab", asy
     op: "list_claims",
   });
   expect(claimsResponse.data.claims.map((claim: any) => claim.tabId)).toEqual([42]);
+  const statusResponse = await request(plugin, {
+    type: "request",
+    id: 4,
+    op: "status",
+  });
+  expect(statusResponse.data.session.groupId).toBeNull();
   plugin.end();
   host.end();
 });
 
-test("broker drops a newly created group seed after reusing a claimed tab", async () => {
+test("broker drops an explicit group seed when a query discovers a real tab", async () => {
   const dir = makeTempDir();
   const socketPath = join(dir, "broker.sock");
   const child = spawn(process.execPath, [join(repoRoot, "bin", "broker.cjs")], {
@@ -223,6 +225,78 @@ test("broker drops a newly created group seed after reusing a claimed tab", asyn
   plugin.write(
     JSON.stringify({ type: "hello", role: "plugin", sessionId: "reuse-session" }) + "\n"
   );
+  const nameSessionResponse = request(plugin, {
+    type: "request",
+    id: 1,
+    op: "name_session",
+    name: "Query session",
+  });
+  const nameSessionRequest = await readLine(host);
+  expect(nameSessionRequest.message.tool).toBe("name_session");
+  sendExtensionResult(host, nameSessionRequest, {
+    content: { groupId: 7, seedTabId: 99 },
+  });
+  expect((await nameSessionResponse).ok).toBeTrue();
+
+  const getActiveTabResponse = request(plugin, {
+    type: "request",
+    id: 2,
+    op: "tool",
+    tool: "get_active_tab",
+    args: {},
+  });
+  const getActiveTabRequest = await readLine(host);
+  expect(getActiveTabRequest.message.tool).toBe("get_active_tab");
+  sendExtensionResult(host, getActiveTabRequest, {
+    tabId: 42,
+    content: { tab: { id: 42, title: "Workbench" } },
+  });
+
+  const next = await Promise.race([
+    readLine(host),
+    getActiveTabResponse.then(() => null),
+  ]);
+  expect(next).not.toBeNull();
+  expect(next.message.tool).toBe("close_tab");
+  expect(next.message.args.tabId).toBe(99);
+  sendExtensionResult(host, next, { tabId: 99, content: { ok: true } });
+  expect((await getActiveTabResponse).ok).toBeTrue();
+
+  const claimsResponse = await request(plugin, {
+    type: "request",
+    id: 3,
+    op: "list_claims",
+  });
+  expect(claimsResponse.data.claims.map((claim: any) => claim.tabId)).toEqual([42]);
+  const statusResponse = await request(plugin, {
+    type: "request",
+    id: 4,
+    op: "status",
+  });
+  expect(statusResponse.data.session.groupId).toBeNull();
+  plugin.end();
+  host.end();
+});
+
+test("broker does not create group seeds for claim-only query sessions", async () => {
+  const dir = makeTempDir();
+  const socketPath = join(dir, "broker.sock");
+  const child = spawn(process.execPath, [join(repoRoot, "bin", "broker.cjs")], {
+    cwd: repoRoot,
+    env: { ...process.env, OPENCODE_BROWSER_BROKER_SOCKET: socketPath },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(child);
+  await waitForOutput(child, "stderr", /listening/);
+
+  const host = await connectSocket(socketPath);
+  host.write(JSON.stringify({ type: "hello", role: "native-host" }) + "\n");
+  expect((await readLine(host)).type).toBe("host_ready");
+
+  const plugin = await connectSocket(socketPath);
+  plugin.write(
+    JSON.stringify({ type: "hello", role: "plugin", sessionId: "claim-query-session" }) + "\n"
+  );
   expect(
     (
       await request(plugin, {
@@ -234,41 +308,85 @@ test("broker drops a newly created group seed after reusing a claimed tab", asyn
     ).ok
   ).toBeTrue();
 
-  const evaluateResponse = request(plugin, {
+  for (const id of [2, 3]) {
+    const getTabsResponse = request(plugin, {
+      type: "request",
+      id,
+      op: "tool",
+      tool: "get_tabs",
+      args: {},
+    });
+    const extensionRequest = await readLine(host);
+    expect(extensionRequest.message.tool).toBe("get_tabs");
+    sendExtensionResult(host, extensionRequest, { content: { tabs: [] } });
+    expect((await getTabsResponse).ok).toBeTrue();
+  }
+
+  const statusResponse = await request(plugin, {
     type: "request",
-    id: 2,
+    id: 4,
+    op: "status",
+  });
+  expect(statusResponse.data.session.groupId).toBeNull();
+  expect(statusResponse.data.claims.map((claim: any) => claim.tabId)).toEqual([42]);
+  plugin.end();
+  host.end();
+});
+
+test("broker still creates a group when opening an agent-owned tab", async () => {
+  const dir = makeTempDir();
+  const socketPath = join(dir, "broker.sock");
+  const child = spawn(process.execPath, [join(repoRoot, "bin", "broker.cjs")], {
+    cwd: repoRoot,
+    env: { ...process.env, OPENCODE_BROWSER_BROKER_SOCKET: socketPath },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(child);
+  await waitForOutput(child, "stderr", /listening/);
+
+  const host = await connectSocket(socketPath);
+  host.write(JSON.stringify({ type: "hello", role: "native-host" }) + "\n");
+  expect((await readLine(host)).type).toBe("host_ready");
+
+  const plugin = await connectSocket(socketPath);
+  plugin.write(
+    JSON.stringify({ type: "hello", role: "plugin", sessionId: "open-session" }) + "\n"
+  );
+
+  const openTabResponse = request(plugin, {
+    type: "request",
+    id: 1,
     op: "tool",
-    tool: "evaluate",
-    args: { tabId: 42, expression: "document.title" },
+    tool: "open_tab",
+    args: { url: "https://example.com" },
   });
   const nameSessionRequest = await readLine(host);
   expect(nameSessionRequest.message.tool).toBe("name_session");
   sendExtensionResult(host, nameSessionRequest, {
     content: { groupId: 7, seedTabId: 99 },
   });
-  const evaluateRequest = await readLine(host);
-  expect(evaluateRequest.message.tool).toBe("evaluate");
-  sendExtensionResult(host, evaluateRequest, {
+
+  const openTabRequest = await readLine(host);
+  expect(openTabRequest.message.tool).toBe("open_tab");
+  expect(openTabRequest.message.args.groupId).toBe(7);
+  sendExtensionResult(host, openTabRequest, {
     tabId: 42,
-    content: { result: "Workbench" },
+    content: { groupId: 7 },
   });
 
-  const next = await Promise.race([
-    readLine(host),
-    evaluateResponse.then(() => null),
-  ]);
-  expect(next).not.toBeNull();
-  expect(next.message.tool).toBe("close_tab");
-  expect(next.message.args.tabId).toBe(99);
-  sendExtensionResult(host, next, { tabId: 99, content: { ok: true } });
-  expect((await evaluateResponse).ok).toBeTrue();
+  const closeSeedRequest = await readLine(host);
+  expect(closeSeedRequest.message.tool).toBe("close_tab");
+  expect(closeSeedRequest.message.args.tabId).toBe(99);
+  sendExtensionResult(host, closeSeedRequest, { tabId: 99, content: { ok: true } });
+  expect((await openTabResponse).ok).toBeTrue();
 
-  const claimsResponse = await request(plugin, {
+  const statusResponse = await request(plugin, {
     type: "request",
-    id: 3,
-    op: "list_claims",
+    id: 2,
+    op: "status",
   });
-  expect(claimsResponse.data.claims.map((claim: any) => claim.tabId)).toEqual([42]);
+  expect(statusResponse.data.session.groupId).toBe(7);
+  expect(statusResponse.data.claims.map((claim: any) => claim.tabId)).toEqual([42]);
   plugin.end();
   host.end();
 });
