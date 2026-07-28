@@ -630,6 +630,7 @@ async function handleTool(pluginSocket, req) {
     } else {
       touchClaim(usedTabId, sessionId);
       setDefaultTab(sessionId, usedTabId);
+      await dropSeedTabIfReplaced(sessionId, usedTabId);
     }
   }
 
@@ -721,6 +722,7 @@ function handleClientMessage(socket, client, msg) {
           }
           setClaim(tabId, sessionId, { origin: "user", mark: null });
           setDefaultTab(sessionId, tabId);
+          await dropSeedTabIfReplaced(sessionId, tabId);
           replyOk({ ok: true, tabId, sessionId, origin: "user" });
           return;
         }

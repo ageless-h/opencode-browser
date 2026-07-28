@@ -88,6 +88,23 @@ async function readLine(socket: ReturnType<typeof createConnection>) {
   });
 }
 
+function sendExtensionResult(
+  socket: ReturnType<typeof createConnection>,
+  request: any,
+  result: unknown
+) {
+  socket.write(
+    JSON.stringify({
+      type: "from_extension",
+      message: {
+        type: "tool_response",
+        id: request.message.id,
+        result,
+      },
+    }) + "\n"
+  );
+}
+
 afterEach(() => {
   for (const child of children.splice(0)) child.kill("SIGTERM");
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -122,6 +139,138 @@ test("broker keeps a replacement connection's session state", async () => {
   expect(response.ok).toBeTrue();
   expect(response.data.session.sessionId).toBe("same-session");
   replacement.end();
+});
+
+test("broker drops a group seed when claim_tab replaces it with a real tab", async () => {
+  const dir = makeTempDir();
+  const socketPath = join(dir, "broker.sock");
+  const child = spawn(process.execPath, [join(repoRoot, "bin", "broker.cjs")], {
+    cwd: repoRoot,
+    env: { ...process.env, OPENCODE_BROWSER_BROKER_SOCKET: socketPath },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(child);
+  await waitForOutput(child, "stderr", /listening/);
+
+  const host = await connectSocket(socketPath);
+  host.write(JSON.stringify({ type: "hello", role: "native-host" }) + "\n");
+  expect((await readLine(host)).type).toBe("host_ready");
+
+  const plugin = await connectSocket(socketPath);
+  plugin.write(
+    JSON.stringify({ type: "hello", role: "plugin", sessionId: "claim-session" }) + "\n"
+  );
+
+  const getTabsResponse = request(plugin, {
+    type: "request",
+    id: 1,
+    op: "tool",
+    tool: "get_tabs",
+    args: {},
+  });
+  const nameSessionRequest = await readLine(host);
+  expect(nameSessionRequest.message.tool).toBe("name_session");
+  sendExtensionResult(host, nameSessionRequest, {
+    content: { groupId: 7, seedTabId: 99 },
+  });
+  const getTabsRequest = await readLine(host);
+  expect(getTabsRequest.message.tool).toBe("get_tabs");
+  sendExtensionResult(host, getTabsRequest, { content: { tabs: [] } });
+  expect((await getTabsResponse).ok).toBeTrue();
+
+  const claimResponse = request(plugin, {
+    type: "request",
+    id: 2,
+    op: "claim_tab",
+    tabId: 42,
+  });
+  const next = await Promise.race([
+    readLine(host),
+    claimResponse.then(() => null),
+  ]);
+  expect(next).not.toBeNull();
+  expect(next.message.tool).toBe("close_tab");
+  expect(next.message.args.tabId).toBe(99);
+  sendExtensionResult(host, next, { tabId: 99, content: { ok: true } });
+  expect((await claimResponse).ok).toBeTrue();
+
+  const claimsResponse = await request(plugin, {
+    type: "request",
+    id: 3,
+    op: "list_claims",
+  });
+  expect(claimsResponse.data.claims.map((claim: any) => claim.tabId)).toEqual([42]);
+  plugin.end();
+  host.end();
+});
+
+test("broker drops a newly created group seed after reusing a claimed tab", async () => {
+  const dir = makeTempDir();
+  const socketPath = join(dir, "broker.sock");
+  const child = spawn(process.execPath, [join(repoRoot, "bin", "broker.cjs")], {
+    cwd: repoRoot,
+    env: { ...process.env, OPENCODE_BROWSER_BROKER_SOCKET: socketPath },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(child);
+  await waitForOutput(child, "stderr", /listening/);
+
+  const host = await connectSocket(socketPath);
+  host.write(JSON.stringify({ type: "hello", role: "native-host" }) + "\n");
+  expect((await readLine(host)).type).toBe("host_ready");
+
+  const plugin = await connectSocket(socketPath);
+  plugin.write(
+    JSON.stringify({ type: "hello", role: "plugin", sessionId: "reuse-session" }) + "\n"
+  );
+  expect(
+    (
+      await request(plugin, {
+        type: "request",
+        id: 1,
+        op: "claim_tab",
+        tabId: 42,
+      })
+    ).ok
+  ).toBeTrue();
+
+  const evaluateResponse = request(plugin, {
+    type: "request",
+    id: 2,
+    op: "tool",
+    tool: "evaluate",
+    args: { tabId: 42, expression: "document.title" },
+  });
+  const nameSessionRequest = await readLine(host);
+  expect(nameSessionRequest.message.tool).toBe("name_session");
+  sendExtensionResult(host, nameSessionRequest, {
+    content: { groupId: 7, seedTabId: 99 },
+  });
+  const evaluateRequest = await readLine(host);
+  expect(evaluateRequest.message.tool).toBe("evaluate");
+  sendExtensionResult(host, evaluateRequest, {
+    tabId: 42,
+    content: { result: "Workbench" },
+  });
+
+  const next = await Promise.race([
+    readLine(host),
+    evaluateResponse.then(() => null),
+  ]);
+  expect(next).not.toBeNull();
+  expect(next.message.tool).toBe("close_tab");
+  expect(next.message.args.tabId).toBe(99);
+  sendExtensionResult(host, next, { tabId: 99, content: { ok: true } });
+  expect((await evaluateResponse).ok).toBeTrue();
+
+  const claimsResponse = await request(plugin, {
+    type: "request",
+    id: 3,
+    op: "list_claims",
+  });
+  expect(claimsResponse.data.claims.map((claim: any) => claim.tabId)).toEqual([42]);
+  plugin.end();
+  host.end();
 });
 
 test("agent gateway refuses remote binding without a strong token", async () => {
